@@ -1,10 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
+  # Version patches
+  "patches/parking_lot_core",
+  "patches/parking_lot",
+  "patches/zstd",
+  "patches/rocksdb",
+
+  # std patches
+  "patches/matches",
+  "patches/is-terminal",
+
+  # Rewrites/redirects
+  "patches/option-ext",
+  "patches/directories-next",
+
   "common/std-shims",
   "common/zalloc",
+  "common/patchable-async-sleep",
   "common/db",
   "common/env",
+  "common/request",
 
   "crypto/transcript",
 
@@ -21,10 +37,28 @@ members = [
   "crypto/frost",
   "crypto/schnorrkel",
 
-  "coins/bitcoin",
-  "coins/ethereum",
-  "coins/monero/generators",
-  "coins/monero",
+  "networks/bitcoin",
+
+  "networks/ethereum/alloy-simple-request-transport",
+  "networks/ethereum",
+  "networks/ethereum/relayer",
+
+  "networks/monero/io",
+  "networks/monero/generators",
+  "networks/monero/primitives",
+  "networks/monero/ringct/mlsag",
+  "networks/monero/ringct/clsag",
+  "networks/monero/ringct/borromean",
+  "networks/monero/ringct/bulletproofs",
+  "networks/monero",
+  "networks/monero/rpc",
+  "networks/monero/rpc/simple-request",
+  "networks/monero/wallet/address",
+  "networks/monero/wallet",
+  "networks/monero/wallet/seed",
+  "networks/monero/wallet/polyseed",
+  "networks/monero/wallet/util",
+  "networks/monero/verify-chain",
 
   "message-queue",
 
@@ -37,19 +71,38 @@ members = [
 
   "substrate/primitives",
 
-  "substrate/tokens/primitives",
-  "substrate/tokens/pallet",
+  "substrate/coins/primitives",
+  "substrate/coins/pallet",
+
+  "substrate/dex/pallet",
+
+  "substrate/validator-sets/primitives",
+  "substrate/validator-sets/pallet",
+
+  "substrate/genesis-liquidity/primitives",
+  "substrate/genesis-liquidity/pallet",
+
+  "substrate/emissions/primitives",
+  "substrate/emissions/pallet",
+
+  "substrate/economic-security/pallet",
 
   "substrate/in-instructions/primitives",
   "substrate/in-instructions/pallet",
 
-  "substrate/validator-sets/primitives",
-  "substrate/validator-sets/pallet",
+  "substrate/signals/primitives",
+  "substrate/signals/pallet",
+
+  "substrate/abi",
 
   "substrate/runtime",
   "substrate/node",
 
   "substrate/client",
+
+  "orchestration",
+
+  "mini",
 
   "tests/no-std",
 
@@ -57,6 +110,7 @@ members = [
   "tests/message-queue",
   "tests/processor",
   "tests/coordinator",
+  "tests/full-stack",
   "tests/reproducible-runtime",
 ]
 
@@ -81,6 +135,79 @@ monero-serai = { opt-level = 3 }
 panic = "unwind"
 
 [patch.crates-io]
-# subxt *can* pull these off crates.io yet there's no benefit to this
-sp-core-hashing = { git = "https://github.com/serai-dex/substrate" }
-sp-std = { git = "https://github.com/serai-dex/substrate" }
+# https://github.com/rust-lang-nursery/lazy-static.rs/issues/201
+lazy_static = { git = "https://github.com/rust-lang-nursery/lazy-static.rs", rev = "5735630d46572f1e5377c8f2ba0f79d18f53b10c" }
+
+parking_lot_core = { path = "patches/parking_lot_core" }
+parking_lot = { path = "patches/parking_lot" }
+# wasmtime pulls in an old version for this
+zstd = { path = "patches/zstd" }
+# Needed for WAL compression
+rocksdb = { path = "patches/rocksdb" }
+
+# is-terminal now has an std-based solution with an equivalent API
+is-terminal = { path = "patches/is-terminal" }
+# So does matches
+matches = { path = "patches/matches" }
+
+# directories-next was created because directories was unmaintained
+# directories-next is now unmaintained while directories is maintained
+# The directories author pulls in ridiculously pointless crates and prefers
+# copyleft licenses
+# The following two patches resolve everything
+option-ext = { path = "patches/option-ext" }
+directories-next = { path = "patches/directories-next" }
+
+# https://github.com/alloy-rs/core/issues/717
+alloy-sol-type-parser = { git = "https://github.com/alloy-rs/core", rev = "446b9d2fbce12b88456152170709a3eaac929af0" }
+
+[workspace.lints.clippy]
+unwrap_or_default = "allow"
+borrow_as_ptr = "deny"
+cast_lossless = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+cast_ptr_alignment = "deny"
+cast_sign_loss = "deny"
+checked_conversions = "deny"
+cloned_instead_of_copied = "deny"
+enum_glob_use = "deny"
+expl_impl_clone_on_copy = "deny"
+explicit_into_iter_loop = "deny"
+explicit_iter_loop = "deny"
+flat_map_option = "deny"
+float_cmp = "deny"
+fn_params_excessive_bools = "deny"
+ignored_unit_patterns = "deny"
+implicit_clone = "deny"
+inefficient_to_string = "deny"
+invalid_upcast_comparisons = "deny"
+large_stack_arrays = "deny"
+linkedlist = "deny"
+macro_use_imports = "deny"
+manual_instant_elapsed = "deny"
+manual_let_else = "deny"
+manual_ok_or = "deny"
+manual_string_new = "deny"
+map_unwrap_or = "deny"
+match_bool = "deny"
+match_same_arms = "deny"
+missing_fields_in_debug = "deny"
+needless_continue = "deny"
+needless_pass_by_value = "deny"
+ptr_cast_constness = "deny"
+range_minus_one = "deny"
+range_plus_one = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_else = "deny"
+string_add_assign = "deny"
+unchecked_duration_subtraction = "deny"
+uninlined_format_args = "deny"
+unnecessary_box_returns = "deny"
+unnecessary_join = "deny"
+unnecessary_wraps = "deny"
+unnested_or_patterns = "deny"
+unused_async = "deny"
+unused_self = "deny"
+zero_sized_map_values = "deny"

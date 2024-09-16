@@ -1,6 +1,6 @@
 use std::{boxed::Box, sync::Arc};
 
-use futures::stream::StreamExt;
+use futures_util::stream::StreamExt;
 
 use sp_timestamp::InherentDataProvider as TimestampInherent;
 use sp_consensus_babe::{SlotDuration, inherents::InherentDataProvider as BabeInherent};
@@ -17,7 +17,7 @@ use sc_client_api::{BlockBackend, Backend};
 
 use sc_telemetry::{Telemetry, TelemetryWorker};
 
-use serai_runtime::{opaque::Block, RuntimeApi};
+use serai_runtime::{Block, RuntimeApi};
 
 use sc_consensus_babe::{self, SlotProportion};
 use sc_consensus_grandpa as grandpa;
@@ -58,7 +58,9 @@ fn create_inherent_data_providers(
   (BabeInherent::from_timestamp_and_slot_duration(*timestamp, slot_duration), timestamp)
 }
 
-pub fn new_partial(config: &Configuration) -> Result<PartialComponents, ServiceError> {
+pub fn new_partial(
+  config: &Configuration,
+) -> Result<(PartialComponents, Arc<dyn sp_keystore::Keystore>), ServiceError> {
   let telemetry = config
     .telemetry_endpoints
     .clone()
@@ -86,6 +88,13 @@ pub fn new_partial(config: &Configuration) -> Result<PartialComponents, ServiceE
       executor,
     )?;
   let client = Arc::new(client);
+
+  let keystore: Arc<dyn sp_keystore::Keystore> =
+    if let Some(keystore) = crate::keystore::Keystore::from_env() {
+      Arc::new(keystore)
+    } else {
+      keystore_container.keystore()
+    };
 
   let telemetry = telemetry.map(|(worker, telemetry)| {
     task_manager.spawn_handle().spawn("telemetry", None, worker.run());
@@ -124,7 +133,7 @@ pub fn new_partial(config: &Configuration) -> Result<PartialComponents, ServiceE
       justification_import: Some(Box::new(justification_import)),
       client: client.clone(),
       select_chain: select_chain.clone(),
-      create_inherent_data_providers: move |_, _| async move {
+      create_inherent_data_providers: move |_, ()| async move {
         Ok(create_inherent_data_providers(slot_duration))
       },
       spawner: &task_manager.spawn_essential_handle(),
@@ -137,29 +146,40 @@ pub fn new_partial(config: &Configuration) -> Result<PartialComponents, ServiceE
   // This won't grow in size, so forgetting this isn't a disastrous memleak
   std::mem::forget(babe_handle);
 
-  Ok(sc_service::PartialComponents {
-    client,
-    backend,
-    task_manager,
-    keystore_container,
-    select_chain,
-    import_queue,
-    transaction_pool,
-    other: (block_import, babe_link, grandpa_link, grandpa::SharedVoterState::empty(), telemetry),
-  })
+  Ok((
+    sc_service::PartialComponents {
+      client,
+      backend,
+      task_manager,
+      keystore_container,
+      select_chain,
+      import_queue,
+      transaction_pool,
+      other: (block_import, babe_link, grandpa_link, grandpa::SharedVoterState::empty(), telemetry),
+    },
+    keystore,
+  ))
 }
 
-pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError> {
-  let sc_service::PartialComponents {
-    client,
-    backend,
-    mut task_manager,
-    import_queue,
+pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> {
+  let (
+    sc_service::PartialComponents {
+      client,
+      backend,
+      mut task_manager,
+      keystore_container: _,
+      import_queue,
+      select_chain,
+      transaction_pool,
+      other: (block_import, babe_link, grandpa_link, shared_voter_state, mut telemetry),
+    },
     keystore_container,
-    select_chain,
-    transaction_pool,
-    other: (block_import, babe_link, grandpa_link, shared_voter_state, mut telemetry),
-  } = new_partial(&config)?;
+  ) = new_partial(&config)?;
+
+  config.network.node_name = "serai".to_string();
+  config.network.client_version = "0.1.0".to_string();
+  config.network.listen_addresses =
+    vec!["/ip4/0.0.0.0/tcp/30333".parse().unwrap(), "/ip6/::/tcp/30333".parse().unwrap()];
 
   let mut net_config = sc_network::config::FullNetworkConfiguration::new(&config.network);
   let grandpa_protocol_name =
@@ -188,6 +208,59 @@ pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError
       warp_sync_params: Some(WarpSyncParams::WithProvider(warp_sync)),
     })?;
 
+  task_manager.spawn_handle().spawn("bootnodes", "bootnodes", {
+    let network = network.clone();
+    let id = config.chain_spec.id().to_string();
+
+    async move {
+      // Transforms the above Multiaddrs into MultiaddrWithPeerIds
+      // While the PeerIds *should* be known in advance and hardcoded, that data wasn't collected in
+      // time and this fine for a testnet
+      let bootnodes = || async {
+        use libp2p::{Transport as TransportTrait, tcp::tokio::Transport, noise::Config};
+
+        let bootnode_multiaddrs = crate::chain_spec::bootnode_multiaddrs(&id);
+
+        let mut tasks = vec![];
+        for multiaddr in bootnode_multiaddrs {
+          tasks.push(tokio::time::timeout(
+            core::time::Duration::from_secs(10),
+            tokio::task::spawn(async move {
+              let Ok(noise) = Config::new(&sc_network::Keypair::generate_ed25519()) else { None? };
+              let mut transport = Transport::default()
+                .upgrade(libp2p::core::upgrade::Version::V1)
+                .authenticate(noise)
+                .multiplex(libp2p::yamux::Config::default());
+              let Ok(transport) = transport.dial(multiaddr.clone()) else { None? };
+              let Ok((peer_id, _)) = transport.await else { None? };
+              Some(sc_network::config::MultiaddrWithPeerId { multiaddr, peer_id })
+            }),
+          ));
+        }
+
+        let mut res = vec![];
+        for task in tasks {
+          if let Ok(Ok(Some(bootnode))) = task.await {
+            res.push(bootnode);
+          }
+        }
+        res
+      };
+
+      use sc_network::{NetworkStatusProvider, NetworkPeers};
+      loop {
+        if let Ok(status) = network.status().await {
+          if status.num_connected_peers < 3 {
+            for bootnode in bootnodes().await {
+              let _ = network.add_reserved_peer(bootnode);
+            }
+          }
+        }
+        tokio::time::sleep(core::time::Duration::from_secs(60)).await;
+      }
+    }
+  });
+
   if config.offchain_worker.enabled {
     task_manager.spawn_handle().spawn(
       "offchain-workers-runner",
@@ -195,7 +268,7 @@ pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError
       sc_offchain::OffchainWorkers::new(sc_offchain::OffchainWorkerOptions {
         runtime_api_provider: client.clone(),
         is_validator: config.role.is_authority(),
-        keystore: Some(keystore_container.keystore()),
+        keystore: Some(keystore_container.clone()),
         offchain_db: backend.offchain_storage(),
         transaction_pool: Some(OffchainTransactionPoolFactory::new(transaction_pool.clone())),
         network_provider: network.clone(),
@@ -206,27 +279,62 @@ pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError
     );
   }
 
+  let role = config.role.clone();
+  let keystore = keystore_container;
+  let prometheus_registry = config.prometheus_registry().cloned();
+
+  // TODO: Ensure we're considered as an authority is a validator of an external network
+  let authority_discovery = if role.is_authority() {
+    let (worker, service) = sc_authority_discovery::new_worker_and_service_with_config(
+      #[allow(clippy::field_reassign_with_default)]
+      {
+        let mut worker = sc_authority_discovery::WorkerConfig::default();
+        worker.publish_non_global_ips = publish_non_global_ips;
+        worker.strict_record_validation = true;
+        worker
+      },
+      client.clone(),
+      network.clone(),
+      Box::pin(network.event_stream("authority-discovery").filter_map(|e| async move {
+        match e {
+          Event::Dht(e) => Some(e),
+          _ => None,
+        }
+      })),
+      sc_authority_discovery::Role::PublishAndDiscover(keystore.clone()),
+      prometheus_registry.clone(),
+    );
+    task_manager.spawn_handle().spawn(
+      "authority-discovery-worker",
+      Some("networking"),
+      worker.run(),
+    );
+
+    Some(service)
+  } else {
+    None
+  };
+
   let rpc_builder = {
+    let id = config.chain_spec.id().to_string();
     let client = client.clone();
     let pool = transaction_pool.clone();
 
     Box::new(move |deny_unsafe, _| {
       crate::rpc::create_full(crate::rpc::FullDeps {
+        id: id.clone(),
         client: client.clone(),
         pool: pool.clone(),
         deny_unsafe,
+        authority_discovery: authority_discovery.clone(),
       })
       .map_err(Into::into)
     })
   };
 
   let enable_grandpa = !config.disable_grandpa;
-  let role = config.role.clone();
   let force_authoring = config.force_authoring;
   let name = config.network.node_name.clone();
-  let prometheus_registry = config.prometheus_registry().cloned();
-
-  let keystore = keystore_container.keystore();
 
   sc_service::spawn_tasks(sc_service::SpawnTasksParams {
     config,
@@ -251,7 +359,7 @@ pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError
       select_chain,
       env: sc_basic_authorship::ProposerFactory::new(
         task_manager.spawn_handle(),
-        client.clone(),
+        client,
         transaction_pool.clone(),
         prometheus_registry.as_ref(),
         telemetry.as_ref().map(Telemetry::handle),
@@ -259,7 +367,7 @@ pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError
       block_import,
       sync_oracle: sync_service.clone(),
       justification_sync_link: sync_service.clone(),
-      create_inherent_data_providers: move |_, _| async move {
+      create_inherent_data_providers: move |_, ()| async move {
         Ok(create_inherent_data_providers(slot_duration))
       },
       force_authoring,
@@ -274,33 +382,6 @@ pub async fn new_full(config: Configuration) -> Result<TaskManager, ServiceError
       "babe-proposer",
       Some("block-authoring"),
       sc_consensus_babe::start_babe(babe_config)?,
-    );
-  }
-
-  if role.is_authority() {
-    task_manager.spawn_handle().spawn(
-      "authority-discovery-worker",
-      Some("networking"),
-      sc_authority_discovery::new_worker_and_service_with_config(
-        #[allow(clippy::field_reassign_with_default)]
-        {
-          let mut worker = sc_authority_discovery::WorkerConfig::default();
-          worker.publish_non_global_ips = publish_non_global_ips;
-          worker
-        },
-        client,
-        network.clone(),
-        Box::pin(network.event_stream("authority-discovery").filter_map(|e| async move {
-          match e {
-            Event::Dht(e) => Some(e),
-            _ => None,
-          }
-        })),
-        sc_authority_discovery::Role::PublishAndDiscover(keystore.clone()),
-        prometheus_registry.clone(),
-      )
-      .0
-      .run(),
     );
   }
 

@@ -45,12 +45,10 @@ impl BitSignature {
     }
   }
 
-  pub(crate) const fn bits(&self) -> usize {
+  pub(crate) const fn bits(&self) -> u8 {
     match self {
-      BitSignature::ClassicLinear => 1,
-      BitSignature::ConciseLinear => 2,
-      BitSignature::EfficientLinear => 1,
-      BitSignature::CompromiseLinear => 2,
+      BitSignature::ClassicLinear | BitSignature::EfficientLinear => 1,
+      BitSignature::ConciseLinear | BitSignature::CompromiseLinear => 2,
     }
   }
 
@@ -60,10 +58,8 @@ impl BitSignature {
 
   fn aos_form<G0: PrimeGroup, G1: PrimeGroup>(&self) -> Re<G0, G1> {
     match self {
-      BitSignature::ClassicLinear => Re::e_default(),
-      BitSignature::ConciseLinear => Re::e_default(),
-      BitSignature::EfficientLinear => Re::R_default(),
-      BitSignature::CompromiseLinear => Re::R_default(),
+      BitSignature::ClassicLinear | BitSignature::ConciseLinear => Re::e_default(),
+      BitSignature::EfficientLinear | BitSignature::CompromiseLinear => Re::R_default(),
     }
   }
 }
@@ -80,14 +76,11 @@ pub(crate) struct Bits<
 }
 
 impl<
-    G0: PrimeGroup + Zeroize,
-    G1: PrimeGroup + Zeroize,
+    G0: PrimeGroup<Scalar: PrimeFieldBits + Zeroize> + Zeroize,
+    G1: PrimeGroup<Scalar: PrimeFieldBits + Zeroize> + Zeroize,
     const SIGNATURE: u8,
     const RING_LEN: usize,
   > Bits<G0, G1, SIGNATURE, RING_LEN>
-where
-  G0::Scalar: PrimeFieldBits + Zeroize,
-  G1::Scalar: PrimeFieldBits + Zeroize,
 {
   fn transcript<T: Transcript>(transcript: &mut T, i: usize, commitments: (G0, G1)) {
     transcript.domain_separate(b"bits");
@@ -129,7 +122,7 @@ where
 
     let signature = Aos::prove(
       rng,
-      transcript.clone(),
+      transcript,
       generators,
       &Self::ring(*pow_2, commitments),
       usize::from(bits),
@@ -155,7 +148,7 @@ where
 
     self.signature.verify(
       rng,
-      transcript.clone(),
+      transcript,
       generators,
       batch,
       &Self::ring(*pow_2, self.commitments),

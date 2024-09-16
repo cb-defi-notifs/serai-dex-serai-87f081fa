@@ -5,13 +5,16 @@ Bitcoin, Ethereum, DAI, and Monero, offering a liquidity-pool-based trading
 experience. Funds are stored in an economically secured threshold-multisig
 wallet.
 
-[Getting Started](docs/Getting%20Started.md)
+[Getting Started](spec/Getting%20Started.md)
 
 ### Layout
 
 - `audits`: Audits for various parts of Serai.
 
-- `docs`: Documentation on the Serai protocol.
+- `spec`: The specification of the Serai protocol, both internally and as
+  networked.
+
+- `docs`: User-facing documentation on the Serai protocol.
 
 - `common`: Crates containing utilities common to a variety of areas under
   Serai, none neatly fitting under another category.
@@ -21,7 +24,7 @@ wallet.
   infrastructure, to our IETF-compliant FROST implementation, to a DLEq proof as
   needed for Bitcoin-Monero atomic swaps.
 
-- `coins`: Various coin libraries intended for usage in Serai yet also by the
+- `networks`: Various libraries intended for usage in Serai yet also by the
   wider community. This means they will always support the functionality Serai
   needs, yet won't disadvantage other use cases when possible.
 
@@ -42,10 +45,22 @@ wallet.
 - `tests`: Tests for various crates. Generally, `crate/src/tests` is used, or
   `crate/tests`, yet any tests requiring crates' binaries are placed here.
 
+### Security
+
+Serai hosts a bug bounty program via
+[Immunefi](https://immunefi.com/bounty/serai/). For in-scope critical
+vulnerabilities, we will reward whitehats with up to $30,000.
+
+Anything not in-scope should still be submitted through Immunefi, with rewards
+issued at the discretion of the Immunefi program managers.
+
 ### Links
 
-- [Twitter](https://twitter.com/SeraiDEX):         https://twitter.com/SeraiDEX
-- [Mastodon](https://cryptodon.lol/@serai):        https://cryptodon.lol/@serai
-- [Discord](https://discord.gg/mpEUtJR3vz):        https://discord.gg/mpEUtJR3vz
-- [Matrix](https://matrix.to/#/#serai:matrix.org):
-https://matrix.to/#/#serai:matrix.org
+- [Website](https://serai.exchange/): https://serai.exchange/
+- [Immunefi](https://immunefi.com/bounty/serai/): https://immunefi.com/bounty/serai/
+- [Twitter](https://twitter.com/SeraiDEX): https://twitter.com/SeraiDEX
+- [Mastodon](https://cryptodon.lol/@serai): https://cryptodon.lol/@serai
+- [Discord](https://discord.gg/mpEUtJR3vz): https://discord.gg/mpEUtJR3vz
+- [Matrix](https://matrix.to/#/#serai:matrix.org): https://matrix.to/#/#serai:matrix.org
+- [Reddit](https://www.reddit.com/r/SeraiDEX/): https://www.reddit.com/r/SeraiDEX/
+- [Telegram](https://t.me/SeraiDEX): https://t.me/SeraiDEX

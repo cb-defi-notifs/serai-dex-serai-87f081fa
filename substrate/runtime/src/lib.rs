@@ -6,28 +6,35 @@
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
+use core::marker::PhantomData;
+
 // Re-export all components
 pub use serai_primitives as primitives;
+pub use primitives::{BlockNumber, Header};
 
 pub use frame_system as system;
 pub use frame_support as support;
 
 pub use pallet_timestamp as timestamp;
 
-pub use pallet_balances as balances;
 pub use pallet_transaction_payment as transaction_payment;
 
-pub use pallet_assets as assets;
-pub use tokens_pallet as tokens;
-pub use in_instructions_pallet as in_instructions;
+pub use coins_pallet as coins;
+pub use dex_pallet as dex;
 
 pub use validator_sets_pallet as validator_sets;
 
-pub use pallet_session as session;
+pub use in_instructions_pallet as in_instructions;
+
+pub use signals_pallet as signals;
+
 pub use pallet_babe as babe;
 pub use pallet_grandpa as grandpa;
 
-pub use pallet_authority_discovery as authority_discovery;
+pub use genesis_liquidity_pallet as genesis_liquidity;
+pub use emissions_pallet as emissions;
+
+pub use economic_security_pallet as economic_security;
 
 // Actually used by the runtime
 use sp_core::OpaqueMetadata;
@@ -39,15 +46,19 @@ use sp_version::NativeVersion;
 
 use sp_runtime::{
   create_runtime_str, generic, impl_opaque_keys, KeyTypeId,
-  traits::{Convert, OpaqueKeys, BlakeTwo256, Block as BlockT},
+  traits::{Convert, BlakeTwo256, Block as BlockT},
   transaction_validity::{TransactionSource, TransactionValidity},
-  ApplyExtrinsicResult, Perbill,
+  BoundedVec, Perbill, ApplyExtrinsicResult,
 };
 
-use primitives::{PublicKey, SeraiAddress, AccountLookup, Signature, SubstrateAmount, Coin};
+#[allow(unused_imports)]
+use primitives::{
+  NetworkId, PublicKey, AccountLookup, SubstrateAmount, Coin, NETWORKS, MEDIAN_PRICE_WINDOW_LENGTH,
+  HOURS, DAYS, MINUTES, TARGET_BLOCK_TIME, BLOCK_SIZE, FAST_EPOCH_DURATION,
+};
 
 use support::{
-  traits::{ConstU8, ConstU32, ConstU64, Contains},
+  traits::{ConstU8, ConstU16, ConstU32, ConstU64, Contains},
   weights::{
     constants::{RocksDbWeight, WEIGHT_REF_TIME_PER_SECOND},
     IdentityFee, Weight,
@@ -55,14 +66,13 @@ use support::{
   parameter_types, construct_runtime,
 };
 
-use transaction_payment::CurrencyAdapter;
+use validator_sets::MembershipProof;
 
+use sp_authority_discovery::AuthorityId as AuthorityDiscoveryId;
 use babe::AuthorityId as BabeId;
 use grandpa::AuthorityId as GrandpaId;
-use sp_authority_discovery::AuthorityId as AuthorityDiscoveryId;
 
-/// An index to a block.
-pub type BlockNumber = u64;
+mod abi;
 
 /// Nonce of a transaction in the chain, for a given account.
 pub type Nonce = u32;
@@ -70,32 +80,37 @@ pub type Nonce = u32;
 /// A hash of some data used by the chain.
 pub type Hash = sp_core::H256;
 
+pub type SignedExtra = (
+  system::CheckNonZeroSender<Runtime>,
+  system::CheckSpecVersion<Runtime>,
+  system::CheckTxVersion<Runtime>,
+  system::CheckGenesis<Runtime>,
+  system::CheckEra<Runtime>,
+  system::CheckNonce<Runtime>,
+  system::CheckWeight<Runtime>,
+  transaction_payment::ChargeTransactionPayment<Runtime>,
+);
+
+pub type Transaction = serai_abi::tx::Transaction<RuntimeCall, SignedExtra>;
+pub type Block = generic::Block<Header, Transaction>;
+pub type BlockId = generic::BlockId<Block>;
+
 pub mod opaque {
   use super::*;
-
-  use sp_runtime::OpaqueExtrinsic as UncheckedExtrinsic;
-
-  pub type Header = generic::Header<BlockNumber, BlakeTwo256>;
-  pub type Block = generic::Block<Header, UncheckedExtrinsic>;
-  pub type BlockId = generic::BlockId<Block>;
 
   impl_opaque_keys! {
     pub struct SessionKeys {
       pub babe: Babe,
       pub grandpa: Grandpa,
-      pub authority_discovery: AuthorityDiscovery,
     }
   }
 }
-
-use opaque::SessionKeys;
 
 #[sp_version::runtime_version]
 pub const VERSION: RuntimeVersion = RuntimeVersion {
   spec_name: create_runtime_str!("serai"),
   impl_name: create_runtime_str!("core"),
-  // TODO: 1? Do we prefer some level of compatibility or our own path?
-  spec_version: 100,
+  spec_version: 1,
   impl_version: 1,
   apis: RUNTIME_API_VERSIONS,
   transaction_version: 1,
@@ -107,18 +122,7 @@ pub fn native_version() -> NativeVersion {
   NativeVersion { runtime_version: VERSION, can_author_with: Default::default() }
 }
 
-// 1 MB
-pub const BLOCK_SIZE: u32 = 1024 * 1024;
-// 6 seconds
-pub const TARGET_BLOCK_TIME: u64 = 6;
-
-/// Measured in blocks.
-pub const MINUTES: BlockNumber = 60 / TARGET_BLOCK_TIME;
-pub const HOURS: BlockNumber = MINUTES * 60;
-pub const DAYS: BlockNumber = HOURS * 24;
-
 pub const PRIMARY_PROBABILITY: (u64, u64) = (1, 4);
-
 pub const BABE_GENESIS_EPOCH_CONFIG: sp_consensus_babe::BabeEpochConfiguration =
   sp_consensus_babe::BabeEpochConfiguration {
     c: PRIMARY_PROBABILITY,
@@ -141,42 +145,14 @@ parameter_types! {
       Weight::from_parts(2u64 * WEIGHT_REF_TIME_PER_SECOND, u64::MAX),
       NORMAL_DISPATCH_RATIO,
     );
-
-  pub const MaxAuthorities: u32 = 100;
 }
 
 pub struct CallFilter;
 impl Contains<RuntimeCall> for CallFilter {
   fn contains(call: &RuntimeCall) -> bool {
-    if let RuntimeCall::Timestamp(call) = call {
-      return matches!(call, timestamp::Call::set { .. });
-    }
-
-    if let RuntimeCall::Balances(call) = call {
-      return matches!(call, balances::Call::transfer { .. } | balances::Call::transfer_all { .. });
-    }
-
-    if let RuntimeCall::Assets(call) = call {
-      return matches!(
-        call,
-        assets::Call::approve_transfer { .. } |
-          assets::Call::cancel_approval { .. } |
-          assets::Call::transfer { .. } |
-          assets::Call::transfer_approved { .. }
-      );
-    }
-    if let RuntimeCall::Tokens(call) = call {
-      return matches!(call, tokens::Call::burn { .. });
-    }
-    if let RuntimeCall::InInstructions(call) = call {
-      return matches!(call, in_instructions::Call::execute_batch { .. });
-    }
-
-    if let RuntimeCall::ValidatorSets(call) = call {
-      return matches!(call, validator_sets::Call::set_keys { .. });
-    }
-
-    false
+    // If the call is defined in our ABI, it's allowed
+    let call: Result<serai_abi::Call, ()> = call.clone().try_into();
+    call.is_ok()
   }
 }
 
@@ -202,7 +178,7 @@ impl system::Config for Runtime {
   type OnKilledAccount = ();
   type OnSetCode = ();
 
-  type AccountData = balances::AccountData<SubstrateAmount>;
+  type AccountData = ();
   type SystemWeightInfo = ();
   type SS58Prefix = SS58Prefix; // TODO: Remove for Bech32m
 
@@ -216,91 +192,42 @@ impl timestamp::Config for Runtime {
   type WeightInfo = ();
 }
 
-impl balances::Config for Runtime {
-  type RuntimeEvent = RuntimeEvent;
-
-  type Balance = SubstrateAmount;
-
-  type ReserveIdentifier = ();
-  type FreezeIdentifier = ();
-  type RuntimeHoldReason = ();
-
-  type MaxLocks = ();
-  type MaxReserves = ();
-  type MaxHolds = ();
-  type MaxFreezes = ();
-
-  type DustRemoval = ();
-  type ExistentialDeposit = ConstU64<1>;
-  type AccountStore = System;
-  type WeightInfo = balances::weights::SubstrateWeight<Runtime>;
-}
-
 impl transaction_payment::Config for Runtime {
   type RuntimeEvent = RuntimeEvent;
-  type OnChargeTransaction = CurrencyAdapter<Balances, ()>;
+  type OnChargeTransaction = Coins;
   type OperationalFeeMultiplier = ConstU8<5>;
   type WeightToFee = IdentityFee<SubstrateAmount>;
   type LengthToFee = IdentityFee<SubstrateAmount>;
   type FeeMultiplierUpdate = ();
 }
 
-#[cfg(feature = "runtime-benchmarks")]
-pub struct SeraiAssetBenchmarkHelper;
-#[cfg(feature = "runtime-benchmarks")]
-impl assets::BenchmarkHelper<Coin> for SeraiAssetBenchmarkHelper {
-  fn create_asset_id_parameter(id: u32) -> Coin {
-    match (id % 4) + 1 {
-      1 => Coin::Bitcoin,
-      2 => Coin::Ether,
-      3 => Coin::Dai,
-      4 => Coin::Monero,
-      _ => panic!("(id % 4) + 1 wasn't in [1, 4]"),
-    }
-  }
+impl coins::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
+  type AllowMint = ValidatorSets;
 }
 
-impl assets::Config for Runtime {
+impl coins::Config<coins::Instance1> for Runtime {
   type RuntimeEvent = RuntimeEvent;
-  type Balance = SubstrateAmount;
-  type Currency = Balances;
-
-  type AssetId = Coin;
-  type AssetIdParameter = Coin;
-  type StringLimit = ConstU32<32>;
-
-  // Don't allow anyone to create assets
-  type CreateOrigin = support::traits::AsEnsureOriginWithArg<system::EnsureNever<PublicKey>>;
-  type ForceOrigin = system::EnsureRoot<PublicKey>;
-
-  // Don't charge fees nor kill accounts
-  type RemoveItemsLimit = ConstU32<0>;
-  type AssetDeposit = ConstU64<0>;
-  type AssetAccountDeposit = ConstU64<0>;
-  type MetadataDepositBase = ConstU64<0>;
-  type MetadataDepositPerByte = ConstU64<0>;
-  type ApprovalDeposit = ConstU64<0>;
-
-  // Unused hooks
-  type CallbackHandle = ();
-  type Freezer = ();
-  type Extra = ();
-
-  type WeightInfo = assets::weights::SubstrateWeight<Runtime>;
-  #[cfg(feature = "runtime-benchmarks")]
-  type BenchmarkHelper = SeraiAssetBenchmarkHelper;
+  type AllowMint = ();
 }
 
-impl tokens::Config for Runtime {
+impl dex::Config for Runtime {
   type RuntimeEvent = RuntimeEvent;
-}
 
-impl in_instructions::Config for Runtime {
-  type RuntimeEvent = RuntimeEvent;
+  type LPFee = ConstU32<3>; // 0.3%
+  type MintMinLiquidity = ConstU64<10000>;
+
+  type MaxSwapPathLength = ConstU32<3>; // coin1 -> SRI -> coin2
+
+  type MedianPriceWindowLength = ConstU16<{ MEDIAN_PRICE_WINDOW_LENGTH }>;
+
+  type WeightInfo = dex::weights::SubstrateWeight<Runtime>;
 }
 
 impl validator_sets::Config for Runtime {
   type RuntimeEvent = RuntimeEvent;
+
+  type ShouldEndSession = Babe;
 }
 
 pub struct IdentityValidatorIdOf;
@@ -310,32 +237,73 @@ impl Convert<PublicKey, Option<PublicKey>> for IdentityValidatorIdOf {
   }
 }
 
-impl session::Config for Runtime {
+impl signals::Config for Runtime {
   type RuntimeEvent = RuntimeEvent;
-  type ValidatorId = PublicKey;
-  type ValidatorIdOf = IdentityValidatorIdOf;
-  type ShouldEndSession = Babe;
-  type NextSessionRotation = Babe;
-  type SessionManager = (); // TODO?
-  type SessionHandler = <SessionKeys as OpaqueKeys>::KeyTypeIdProviders;
-  type Keys = SessionKeys;
-  type WeightInfo = session::weights::SubstrateWeight<Runtime>;
+  // 1 week
+  #[allow(clippy::cast_possible_truncation)]
+  type RetirementValidityDuration = ConstU32<{ (7 * 24 * 60 * 60) / (TARGET_BLOCK_TIME as u32) }>;
+  // 2 weeks
+  #[allow(clippy::cast_possible_truncation)]
+  type RetirementLockInDuration = ConstU32<{ (2 * 7 * 24 * 60 * 60) / (TARGET_BLOCK_TIME as u32) }>;
 }
 
+impl in_instructions::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
+}
+
+impl genesis_liquidity::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
+}
+
+impl emissions::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
+}
+
+impl economic_security::Config for Runtime {
+  type RuntimeEvent = RuntimeEvent;
+}
+
+// for publishing equivocation evidences.
+impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
+where
+  RuntimeCall: From<C>,
+{
+  type Extrinsic = Transaction;
+  type OverarchingCall = RuntimeCall;
+}
+
+// for validating equivocation evidences.
+// The following runtime construction doesn't actually implement the pallet as doing so is
+// unnecessary
+// TODO: Replace the requirement on Config for a requirement on FindAuthor directly
+impl pallet_authorship::Config for Runtime {
+  type FindAuthor = ValidatorSets;
+  type EventHandler = ();
+}
+
+// Maximum number of authorities per session.
+pub type MaxAuthorities = ConstU32<{ validator_sets::primitives::MAX_KEY_SHARES_PER_SET }>;
+
+/// Longevity of an offence report.
+pub type ReportLongevity = <Runtime as pallet_babe::Config>::EpochDuration;
+
 impl babe::Config for Runtime {
-  #[allow(clippy::identity_op)]
-  type EpochDuration = ConstU64<{ 1 * DAYS }>;
+  #[cfg(feature = "fast-epoch")]
+  type EpochDuration = ConstU64<{ FAST_EPOCH_DURATION }>;
+
+  #[cfg(not(feature = "fast-epoch"))]
+  type EpochDuration = ConstU64<{ 4 * 7 * DAYS }>;
+
   type ExpectedBlockTime = ConstU64<{ TARGET_BLOCK_TIME * 1000 }>;
-  type EpochChangeTrigger = pallet_babe::ExternalTrigger;
-  type DisabledValidators = Session;
+  type EpochChangeTrigger = babe::ExternalTrigger;
+  type DisabledValidators = ValidatorSets;
 
   type WeightInfo = ();
-
   type MaxAuthorities = MaxAuthorities;
 
-  // TODO: Handle equivocation reports
-  type KeyOwnerProof = sp_core::Void;
-  type EquivocationReportSystem = ();
+  type KeyOwnerProof = MembershipProof<Self>;
+  type EquivocationReportSystem =
+    babe::EquivocationReportSystem<Self, ValidatorSets, ValidatorSets, ReportLongevity>;
 }
 
 impl grandpa::Config for Runtime {
@@ -344,31 +312,12 @@ impl grandpa::Config for Runtime {
   type WeightInfo = ();
   type MaxAuthorities = MaxAuthorities;
 
-  // TODO: Handle equivocation reports
   type MaxSetIdSessionEntries = ConstU64<0>;
-  type KeyOwnerProof = sp_core::Void;
-  type EquivocationReportSystem = ();
+  type KeyOwnerProof = MembershipProof<Self>;
+  type EquivocationReportSystem =
+    grandpa::EquivocationReportSystem<Self, ValidatorSets, ValidatorSets, ReportLongevity>;
 }
 
-impl authority_discovery::Config for Runtime {
-  type MaxAuthorities = MaxAuthorities;
-}
-
-pub type Header = generic::Header<BlockNumber, BlakeTwo256>;
-pub type Block = generic::Block<Header, UncheckedExtrinsic>;
-pub type SignedExtra = (
-  system::CheckNonZeroSender<Runtime>,
-  system::CheckSpecVersion<Runtime>,
-  system::CheckTxVersion<Runtime>,
-  system::CheckGenesis<Runtime>,
-  system::CheckEra<Runtime>,
-  system::CheckNonce<Runtime>,
-  system::CheckWeight<Runtime>,
-  transaction_payment::ChargeTransactionPayment<Runtime>,
-);
-pub type UncheckedExtrinsic =
-  generic::UncheckedExtrinsic<SeraiAddress, RuntimeCall, Signature, SignedExtra>;
-pub type SignedPayload = generic::SignedPayload<RuntimeCall, SignedExtra>;
 pub type Executive = frame_executive::Executive<
   Runtime,
   Block,
@@ -379,24 +328,28 @@ pub type Executive = frame_executive::Executive<
 
 construct_runtime!(
   pub enum Runtime {
-    System: system,
+    System: system exclude_parts { Call },
 
     Timestamp: timestamp,
 
-    Balances: balances,
     TransactionPayment: transaction_payment,
 
-    Assets: assets,
-    Tokens: tokens,
-    InInstructions: in_instructions,
+    Coins: coins,
+    LiquidityTokens: coins::<Instance1>::{Pallet, Call, Storage, Event<T>},
+    Dex: dex,
 
     ValidatorSets: validator_sets,
+    GenesisLiquidity: genesis_liquidity,
+    Emissions: emissions,
 
-    Session: session,
+    EconomicSecurity: economic_security,
+
+    InInstructions: in_instructions,
+
+    Signals: signals,
+
     Babe: babe,
     Grandpa: grandpa,
-
-    AuthorityDiscovery: authority_discovery,
   }
 );
 
@@ -420,6 +373,13 @@ mod benches {
   );
 }
 
+sp_api::decl_runtime_apis! {
+  #[api_version(1)]
+  pub trait SeraiRuntimeApi {
+    fn validators(network_id: NetworkId) -> Vec<PublicKey>;
+  }
+}
+
 sp_api::impl_runtime_apis! {
   impl sp_api::Core<Block> for Runtime {
     fn version() -> RuntimeVersion {
@@ -430,7 +390,7 @@ sp_api::impl_runtime_apis! {
       Executive::execute_block(block);
     }
 
-    fn initialize_block(header: &<Block as BlockT>::Header) {
+    fn initialize_block(header: &Header) {
       Executive::initialize_block(header)
     }
   }
@@ -454,7 +414,7 @@ sp_api::impl_runtime_apis! {
       Executive::apply_extrinsic(extrinsic)
     }
 
-    fn finalize_block() -> <Block as BlockT>::Header {
+    fn finalize_block() -> Header {
       Executive::finalize_block()
     }
 
@@ -481,7 +441,7 @@ sp_api::impl_runtime_apis! {
   }
 
   impl sp_offchain::OffchainWorkerApi<Block> for Runtime {
-    fn offchain_worker(header: &<Block as BlockT>::Header) {
+    fn offchain_worker(header: &Header) {
       Executive::offchain_worker(header)
     }
   }
@@ -525,18 +485,22 @@ sp_api::impl_runtime_apis! {
       Babe::next_epoch()
     }
 
+    // This refers to a key being 'owned' by an authority in a system with multiple keys per
+    // validator
+    // Since we do not have such an infrastructure, we do not need this
     fn generate_key_ownership_proof(
-      _: sp_consensus_babe::Slot,
-      _: BabeId,
+      _slot: sp_consensus_babe::Slot,
+      _authority_id: BabeId,
     ) -> Option<sp_consensus_babe::OpaqueKeyOwnershipProof> {
-      None
+      Some(sp_consensus_babe::OpaqueKeyOwnershipProof::new(vec![]))
     }
 
     fn submit_report_equivocation_unsigned_extrinsic(
-      _: sp_consensus_babe::EquivocationProof<<Block as BlockT>::Header>,
+      equivocation_proof: sp_consensus_babe::EquivocationProof<Header>,
       _: sp_consensus_babe::OpaqueKeyOwnershipProof,
     ) -> Option<()> {
-      None
+      let proof = MembershipProof(equivocation_proof.offender.clone().into(), PhantomData);
+      Babe::submit_unsigned_equivocation_report(equivocation_proof, proof)
     }
   }
 
@@ -549,18 +513,19 @@ sp_api::impl_runtime_apis! {
       Grandpa::current_set_id()
     }
 
-    fn submit_report_equivocation_unsigned_extrinsic(
-      _: sp_consensus_grandpa::EquivocationProof<<Block as BlockT>::Hash, u64>,
-      _: sp_consensus_grandpa::OpaqueKeyOwnershipProof,
-    ) -> Option<()> {
-      None
-    }
-
     fn generate_key_ownership_proof(
       _set_id: sp_consensus_grandpa::SetId,
       _authority_id: GrandpaId,
     ) -> Option<sp_consensus_grandpa::OpaqueKeyOwnershipProof> {
-      None
+      Some(sp_consensus_grandpa::OpaqueKeyOwnershipProof::new(vec![]))
+    }
+
+    fn submit_report_equivocation_unsigned_extrinsic(
+      equivocation_proof: sp_consensus_grandpa::EquivocationProof<<Block as BlockT>::Hash, u64>,
+      _: sp_consensus_grandpa::OpaqueKeyOwnershipProof,
+    ) -> Option<()> {
+      let proof = MembershipProof(equivocation_proof.offender().clone().into(), PhantomData);
+      Grandpa::submit_unsigned_equivocation_report(equivocation_proof, proof)
     }
   }
 
@@ -599,7 +564,71 @@ sp_api::impl_runtime_apis! {
 
   impl sp_authority_discovery::AuthorityDiscoveryApi<Block> for Runtime {
     fn authorities() -> Vec<AuthorityDiscoveryId> {
-      AuthorityDiscovery::authorities()
+      // Converts to `[u8; 32]` so it can be hashed
+      let serai_validators = Babe::authorities()
+        .into_iter()
+        .map(|(id, _)| id.into_inner().0)
+        .collect::<hashbrown::HashSet<_>>();
+      let mut all = serai_validators;
+      for network in NETWORKS {
+        if network == NetworkId::Serai {
+          continue;
+        }
+        // Returning the latest-decided, not latest and active, means the active set
+        // may fail to peer find if there isn't sufficient overlap. If a large amount reboot,
+        // forcing some validators to successfully peer find in order for the threshold to become
+        // online again, this may cause a liveness failure.
+        //
+        // This is assumed not to matter in real life, yet an interesting note.
+        let participants =
+          ValidatorSets::participants_for_latest_decided_set(network)
+            .map_or(vec![], BoundedVec::into_inner);
+        for (participant, _) in participants {
+          all.insert(participant.0);
+        }
+      }
+      all.into_iter().map(|id| AuthorityDiscoveryId::from(PublicKey::from_raw(id))).collect()
+    }
+  }
+
+  impl crate::SeraiRuntimeApi<Block> for Runtime {
+    fn validators(network_id: NetworkId) -> Vec<PublicKey> {
+      if network_id == NetworkId::Serai {
+        Babe::authorities()
+          .into_iter()
+          .map(|(id, _)| id.into_inner())
+          .collect()
+      } else {
+        ValidatorSets::participants_for_latest_decided_set(network_id)
+          .map_or(
+            vec![],
+            |vec| vec.into_inner().into_iter().map(|(validator, _)| validator).collect()
+          )
+      }
+    }
+  }
+
+  impl dex::DexApi<Block> for Runtime {
+    fn quote_price_exact_tokens_for_tokens(
+      asset1: Coin,
+      asset2: Coin,
+      amount: SubstrateAmount,
+      include_fee: bool
+    ) -> Option<SubstrateAmount> {
+      Dex::quote_price_exact_tokens_for_tokens(asset1, asset2, amount, include_fee)
+    }
+
+    fn quote_price_tokens_for_exact_tokens(
+      asset1: Coin,
+      asset2: Coin,
+      amount: SubstrateAmount,
+      include_fee: bool
+    ) -> Option<SubstrateAmount> {
+      Dex::quote_price_tokens_for_exact_tokens(asset1, asset2, amount, include_fee)
+    }
+
+    fn get_reserves(asset1: Coin, asset2: Coin) -> Option<(SubstrateAmount, SubstrateAmount)> {
+      Dex::get_reserves(&asset1, &asset2).ok()
     }
   }
 }

@@ -1,5 +1,5 @@
 use core::fmt::Debug;
-use std::{io, collections::HashMap};
+use std::io;
 
 use zeroize::Zeroize;
 use thiserror::Error;
@@ -31,6 +31,12 @@ pub enum TransactionError {
   /// Transaction's content is invalid.
   #[error("transaction content is invalid")]
   InvalidContent,
+  /// Transaction's signer has too many transactions in the mempool.
+  #[error("signer has too many transactions in the mempool")]
+  TooManyInMempool,
+  /// Provided Transaction added to mempool.
+  #[error("provided transaction added to mempool")]
+  ProvidedAddedToMempool,
 }
 
 /// Data for a signed transaction.
@@ -49,7 +55,7 @@ impl ReadWrite for Signed {
     reader.read_exact(&mut nonce)?;
     let nonce = u32::from_le_bytes(nonce);
     if nonce >= (u32::MAX - 1) {
-      Err(io::Error::new(io::ErrorKind::Other, "nonce exceeded limit"))?;
+      Err(io::Error::other("nonce exceeded limit"))?;
     }
 
     let mut signature = SchnorrSignature::<Ristretto>::read(reader)?;
@@ -58,7 +64,7 @@ impl ReadWrite for Signed {
       // We should never produce zero signatures though meaning this should never come up
       // If it does somehow come up, this is a decent courtesy
       signature.zeroize();
-      Err(io::Error::new(io::ErrorKind::Other, "signature nonce was identity"))?;
+      Err(io::Error::other("signature nonce was identity"))?;
     }
 
     Ok(Signed { signer, nonce, signature })
@@ -67,7 +73,7 @@ impl ReadWrite for Signed {
   fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
     // This is either an invalid signature or a private key leak
     if self.signature.R.is_identity().into() {
-      Err(io::Error::new(io::ErrorKind::Other, "signature nonce was identity"))?;
+      Err(io::Error::other("signature nonce was identity"))?;
     }
     writer.write_all(&self.signer.to_bytes())?;
     writer.write_all(&self.nonce.to_le_bytes())?;
@@ -75,10 +81,36 @@ impl ReadWrite for Signed {
   }
 }
 
+impl Signed {
+  pub fn read_without_nonce<R: io::Read>(reader: &mut R, nonce: u32) -> io::Result<Self> {
+    let signer = Ristretto::read_G(reader)?;
+
+    let mut signature = SchnorrSignature::<Ristretto>::read(reader)?;
+    if signature.R.is_identity().into() {
+      // Anyone malicious could remove this and try to find zero signatures
+      // We should never produce zero signatures though meaning this should never come up
+      // If it does somehow come up, this is a decent courtesy
+      signature.zeroize();
+      Err(io::Error::other("signature nonce was identity"))?;
+    }
+
+    Ok(Signed { signer, nonce, signature })
+  }
+
+  pub fn write_without_nonce<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+    // This is either an invalid signature or a private key leak
+    if self.signature.R.is_identity().into() {
+      Err(io::Error::other("signature nonce was identity"))?;
+    }
+    writer.write_all(&self.signer.to_bytes())?;
+    self.signature.write(writer)
+  }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TransactionKind<'a> {
-  /// This tranaction should be provided by every validator, in an exact order.
+  /// This transaction should be provided by every validator, in an exact order.
   ///
   /// The contained static string names the orderer to use. This allows two distinct provided
   /// transaction kinds, without a synchronized order, to be ordered within their own kind without
@@ -87,17 +119,29 @@ pub enum TransactionKind<'a> {
   /// The only malleability is in when this transaction appears on chain. The block producer will
   /// include it when they have it. Block verification will fail for validators without it.
   ///
-  /// If a supermajority of validators still produce a commit for a block with a provided
-  /// transaction which isn't locally held, the chain will sleep until it is locally provided.
+  /// If a supermajority of validators produce a commit for a block with a provided transaction
+  /// which isn't locally held, the block will be added to the local chain. When the transaction is
+  /// locally provided, it will be compared for correctness to the on-chain version
+  ///
+  /// In order to ensure TXs aren't accidentally provided multiple times, all provided transactions
+  /// must have a unique hash which is also unique to all Unsigned transactions.
   Provided(&'static str),
 
   /// An unsigned transaction, only able to be included by the block producer.
+  ///
+  /// Once an Unsigned transaction is included on-chain, it may not be included again. In order to
+  /// have multiple Unsigned transactions with the same values included on-chain, some distinct
+  /// nonce must be included in order to cause a distinct hash.
+  ///
+  /// The hash must also be unique with all Provided transactions.
   Unsigned,
 
   /// A signed transaction.
-  Signed(&'a Signed),
+  Signed(Vec<u8>, &'a Signed),
 }
 
+// TODO: Should this be renamed TransactionTrait now that a literal Transaction exists?
+// Or should the literal Transaction be renamed to Event?
 pub trait Transaction: 'static + Send + Sync + Clone + Eq + Debug + ReadWrite {
   /// Return what type of transaction this is.
   fn kind(&self) -> TransactionKind<'_>;
@@ -117,10 +161,17 @@ pub trait Transaction: 'static + Send + Sync + Clone + Eq + Debug + ReadWrite {
   /// Panics if called on non-signed transactions.
   fn sig_hash(&self, genesis: [u8; 32]) -> <Ristretto as Ciphersuite>::F {
     match self.kind() {
-      TransactionKind::Signed(Signed { signature, .. }) => {
+      TransactionKind::Signed(order, Signed { signature, .. }) => {
         <Ristretto as Ciphersuite>::F::from_bytes_mod_order_wide(
           &Blake2b512::digest(
-            [genesis.as_ref(), &self.hash(), signature.R.to_bytes().as_ref()].concat(),
+            [
+              b"Tributary Signed Transaction",
+              genesis.as_ref(),
+              &self.hash(),
+              order.as_ref(),
+              signature.R.to_bytes().as_ref(),
+            ]
+            .concat(),
           )
           .into(),
         )
@@ -130,11 +181,13 @@ pub trait Transaction: 'static + Send + Sync + Clone + Eq + Debug + ReadWrite {
   }
 }
 
-// This will only cause mutations when the transaction is valid
-pub(crate) fn verify_transaction<T: Transaction>(
+pub trait GAIN: FnMut(&<Ristretto as Ciphersuite>::G, &[u8]) -> Option<u32> {}
+impl<F: FnMut(&<Ristretto as Ciphersuite>::G, &[u8]) -> Option<u32>> GAIN for F {}
+
+pub(crate) fn verify_transaction<F: GAIN, T: Transaction>(
   tx: &T,
   genesis: [u8; 32],
-  next_nonces: &mut HashMap<<Ristretto as Ciphersuite>::G, u32>,
+  get_and_increment_nonce: &mut F,
 ) -> Result<(), TransactionError> {
   if tx.serialize().len() > TRANSACTION_SIZE_LIMIT {
     Err(TransactionError::TooLargeTransaction)?;
@@ -143,11 +196,10 @@ pub(crate) fn verify_transaction<T: Transaction>(
   tx.verify()?;
 
   match tx.kind() {
-    TransactionKind::Provided(_) => {}
-    TransactionKind::Unsigned => {}
-    TransactionKind::Signed(Signed { signer, nonce, signature }) => {
-      if let Some(next_nonce) = next_nonces.get(signer) {
-        if nonce != next_nonce {
+    TransactionKind::Provided(_) | TransactionKind::Unsigned => {}
+    TransactionKind::Signed(order, Signed { signer, nonce, signature }) => {
+      if let Some(next_nonce) = get_and_increment_nonce(signer, &order) {
+        if *nonce != next_nonce {
           Err(TransactionError::InvalidNonce)?;
         }
       } else {
@@ -155,12 +207,10 @@ pub(crate) fn verify_transaction<T: Transaction>(
         Err(TransactionError::InvalidSigner)?;
       }
 
-      // TODO: Use Schnorr half-aggregation and a batch verification here
+      // TODO: Use a batch verification here
       if !signature.verify(*signer, tx.sig_hash(genesis)) {
         Err(TransactionError::InvalidSignature)?;
       }
-
-      next_nonces.insert(*signer, nonce + 1);
     }
   }
 

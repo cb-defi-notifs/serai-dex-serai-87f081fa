@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use parity_scale_codec::{Encode, Decode};
 
-use crate::{SignedMessageFor, commit_msg};
+use crate::{SignedMessageFor, SlashEvent, commit_msg};
 
 /// An alias for a series of traits required for a type to be usable as a validator ID,
 /// automatically implemented for all types satisfying those traits.
@@ -21,8 +21,8 @@ impl<V: Send + Sync + Clone + Copy + PartialEq + Eq + Hash + Debug + Encode + De
 
 /// An alias for a series of traits required for a type to be usable as a signature,
 /// automatically implemented for all types satisfying those traits.
-pub trait Signature: Send + Sync + Clone + PartialEq + Debug + Encode + Decode {}
-impl<S: Send + Sync + Clone + PartialEq + Debug + Encode + Decode> Signature for S {}
+pub trait Signature: Send + Sync + Clone + PartialEq + Eq + Debug + Encode + Decode {}
+impl<S: Send + Sync + Clone + PartialEq + Eq + Debug + Encode + Decode> Signature for S {}
 
 // Type aliases which are distinct according to the type system
 
@@ -62,7 +62,7 @@ impl<S: Signer> Signer for Arc<S> {
 }
 
 /// A signature scheme used by validators.
-pub trait SignatureScheme: Send + Sync {
+pub trait SignatureScheme: Send + Sync + Clone {
   // Type used to identify validators.
   type ValidatorId: ValidatorId;
   /// Signature type.
@@ -81,7 +81,13 @@ pub trait SignatureScheme: Send + Sync {
   fn verify(&self, validator: Self::ValidatorId, msg: &[u8], sig: &Self::Signature) -> bool;
 
   /// Aggregate signatures.
-  fn aggregate(sigs: &[Self::Signature]) -> Self::AggregateSignature;
+  /// It may panic if corrupted data passed in.
+  fn aggregate(
+    &self,
+    validators: &[Self::ValidatorId],
+    msg: &[u8],
+    sigs: &[Self::Signature],
+  ) -> Self::AggregateSignature;
   /// Verify an aggregate signature for the list of signers.
   #[must_use]
   fn verify_aggregate(
@@ -102,8 +108,13 @@ impl<S: SignatureScheme> SignatureScheme for Arc<S> {
     self.as_ref().verify(validator, msg, sig)
   }
 
-  fn aggregate(sigs: &[Self::Signature]) -> Self::AggregateSignature {
-    S::aggregate(sigs)
+  fn aggregate(
+    &self,
+    validators: &[Self::ValidatorId],
+    msg: &[u8],
+    sigs: &[Self::Signature],
+  ) -> Self::AggregateSignature {
+    self.as_ref().aggregate(validators, msg, sigs)
   }
 
   #[must_use]
@@ -153,7 +164,7 @@ pub trait Weights: Send + Sync {
     ((self.total_weight() * 2) / 3) + 1
   }
   /// Threshold preventing BFT consensus.
-  fn fault_thresold(&self) -> u64 {
+  fn fault_threshold(&self) -> u64 {
     (self.total_weight() - self.threshold()) + 1
   }
 
@@ -190,9 +201,9 @@ pub enum BlockError {
 }
 
 /// Trait representing a Block.
-pub trait Block: Send + Sync + Clone + PartialEq + Debug + Encode + Decode {
+pub trait Block: Send + Sync + Clone + PartialEq + Eq + Debug + Encode + Decode {
   // Type used to identify blocks. Presumably a cryptographic hash of the block.
-  type Id: Send + Sync + Copy + Clone + PartialEq + AsRef<[u8]> + Debug + Encode + Decode;
+  type Id: Send + Sync + Copy + Clone + PartialEq + Eq + AsRef<[u8]> + Debug + Encode + Decode;
 
   /// Return the deterministic, unique ID for this block.
   fn id(&self) -> Self::Id;
@@ -200,7 +211,10 @@ pub trait Block: Send + Sync + Clone + PartialEq + Debug + Encode + Decode {
 
 /// Trait representing the distributed system Tendermint is providing consensus over.
 #[async_trait]
-pub trait Network: Send + Sync {
+pub trait Network: Sized + Send + Sync {
+  /// The database used to back this.
+  type Db: serai_db::Db;
+
   // Type used to identify validators.
   type ValidatorId: ValidatorId;
   /// Signature scheme used by validators.
@@ -210,15 +224,23 @@ pub trait Network: Send + Sync {
   /// Type used for ordered blocks of information.
   type Block: Block;
 
-  /// Maximum block processing time in seconds. This should include both the actual processing time
-  /// and the time to download the block.
+  /// Maximum block processing time in milliseconds.
+  ///
+  /// This should include both the time to download the block and the actual processing time.
+  ///
+  /// BLOCK_PROCESSING_TIME + (3 * LATENCY_TIME) must be divisible by 1000.
   const BLOCK_PROCESSING_TIME: u32;
-  /// Network latency time in seconds.
+  /// Network latency time in milliseconds.
+  ///
+  /// BLOCK_PROCESSING_TIME + (3 * LATENCY_TIME) must be divisible by 1000.
   const LATENCY_TIME: u32;
 
-  /// The block time is defined as the processing time plus three times the latency.
+  /// The block time, in seconds. Defined as the processing time plus three times the latency.
   fn block_time() -> u32 {
-    Self::BLOCK_PROCESSING_TIME + (3 * Self::LATENCY_TIME)
+    let raw = Self::BLOCK_PROCESSING_TIME + (3 * Self::LATENCY_TIME);
+    let res = raw / 1000;
+    assert_eq!(res * 1000, raw);
+    res
   }
 
   /// Return a handle on the signer in use, usable for the entire lifetime of the machine.
@@ -263,11 +285,10 @@ pub trait Network: Send + Sync {
   /// Trigger a slash for the validator in question who was definitively malicious.
   ///
   /// The exact process of triggering a slash is undefined and left to the network as a whole.
-  // TODO: We need to provide some evidence for this.
-  async fn slash(&mut self, validator: Self::ValidatorId);
+  async fn slash(&mut self, validator: Self::ValidatorId, slash_event: SlashEvent);
 
   /// Validate a block.
-  async fn validate(&mut self, block: &Self::Block) -> Result<(), BlockError>;
+  async fn validate(&self, block: &Self::Block) -> Result<(), BlockError>;
 
   /// Add a block, returning the proposal for the next one.
   ///

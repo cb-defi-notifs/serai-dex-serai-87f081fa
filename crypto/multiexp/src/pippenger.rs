@@ -5,12 +5,12 @@ use group::Group;
 
 use crate::prep_bits;
 
-// Pippenger's algorithm for multiexponentation, as published in the SIAM Journal on Computing
+// Pippenger's algorithm for multiexponentiation, as published in the SIAM Journal on Computing
 // DOI: 10.1137/0209022
-pub(crate) fn pippenger<G: Group>(pairs: &[(G::Scalar, G)], window: u8) -> G
-where
-  G::Scalar: PrimeFieldBits,
-{
+pub(crate) fn pippenger<G: Group<Scalar: PrimeFieldBits>>(
+  pairs: &[(G::Scalar, G)],
+  window: u8,
+) -> G {
   let mut bits = prep_bits(pairs, window);
 
   let mut res = G::identity();
@@ -37,10 +37,10 @@ where
   res
 }
 
-pub(crate) fn pippenger_vartime<G: Group>(pairs: &[(G::Scalar, G)], window: u8) -> G
-where
-  G::Scalar: PrimeFieldBits,
-{
+pub(crate) fn pippenger_vartime<G: Group<Scalar: PrimeFieldBits>>(
+  pairs: &[(G::Scalar, G)],
+  window: u8,
+) -> G {
   let bits = prep_bits(pairs, window);
 
   let mut res = G::identity();

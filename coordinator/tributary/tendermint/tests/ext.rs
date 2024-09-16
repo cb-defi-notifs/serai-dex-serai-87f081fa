@@ -7,12 +7,14 @@ use async_trait::async_trait;
 
 use parity_scale_codec::{Encode, Decode};
 
-use futures::SinkExt;
+use futures_util::sink::SinkExt;
 use tokio::{sync::RwLock, time::sleep};
+
+use serai_db::MemDb;
 
 use tendermint_machine::{
   ext::*, SignedMessageFor, SyncedBlockSender, SyncedBlockResultReceiver, MessageSender,
-  TendermintMachine, TendermintHandle,
+  SlashEvent, TendermintMachine, TendermintHandle,
 };
 
 type TestValidatorId = u16;
@@ -36,6 +38,7 @@ impl Signer for TestSigner {
   }
 }
 
+#[derive(Clone)]
 struct TestSignatureScheme;
 impl SignatureScheme for TestSignatureScheme {
   type ValidatorId = TestValidatorId;
@@ -48,7 +51,12 @@ impl SignatureScheme for TestSignatureScheme {
     (sig[.. 2] == validator.to_le_bytes()) && (sig[2 ..] == [msg, &[0; 30]].concat()[.. 30])
   }
 
-  fn aggregate(sigs: &[[u8; 32]]) -> Vec<[u8; 32]> {
+  fn aggregate(
+    &self,
+    _: &[Self::ValidatorId],
+    _: &[u8],
+    sigs: &[Self::Signature],
+  ) -> Self::AggregateSignature {
     sigs.to_vec()
   }
 
@@ -75,7 +83,7 @@ impl Weights for TestWeights {
     4
   }
   fn weight(&self, id: TestValidatorId) -> u64 {
-    [1; 4][usize::try_from(id).unwrap()]
+    [1; 4][usize::from(id)]
   }
 
   fn proposer(&self, number: BlockNumber, round: RoundNumber) -> TestValidatorId {
@@ -83,7 +91,7 @@ impl Weights for TestWeights {
   }
 }
 
-#[derive(Clone, PartialEq, Debug, Encode, Decode)]
+#[derive(Clone, PartialEq, Eq, Debug, Encode, Decode)]
 struct TestBlock {
   id: TestBlockId,
   valid: Result<(), BlockError>,
@@ -105,13 +113,15 @@ struct TestNetwork(
 
 #[async_trait]
 impl Network for TestNetwork {
+  type Db = MemDb;
+
   type ValidatorId = TestValidatorId;
   type SignatureScheme = TestSignatureScheme;
   type Weights = TestWeights;
   type Block = TestBlock;
 
-  const BLOCK_PROCESSING_TIME: u32 = 2;
-  const LATENCY_TIME: u32 = 1;
+  const BLOCK_PROCESSING_TIME: u32 = 2000;
+  const LATENCY_TIME: u32 = 1000;
 
   fn signer(&self) -> TestSigner {
     TestSigner(self.0)
@@ -131,12 +141,11 @@ impl Network for TestNetwork {
     }
   }
 
-  async fn slash(&mut self, _: TestValidatorId) {
-    dbg!("Slash");
-    todo!()
+  async fn slash(&mut self, id: TestValidatorId, event: SlashEvent) {
+    println!("Slash for {id} due to {event:?}");
   }
 
-  async fn validate(&mut self, block: &TestBlock) -> Result<(), BlockError> {
+  async fn validate(&self, block: &TestBlock) -> Result<(), BlockError> {
     block.valid
   }
 
@@ -145,7 +154,7 @@ impl Network for TestNetwork {
     block: TestBlock,
     commit: Commit<TestSignatureScheme>,
   ) -> Option<TestBlock> {
-    dbg!("Adding ", &block);
+    println!("Adding {:?}", &block);
     assert!(block.valid.is_ok());
     assert!(self.verify_commit(block.id(), &commit));
     Some(TestBlock { id: (u32::from_le_bytes(block.id) + 1).to_le_bytes(), valid: Ok(()) })
@@ -155,6 +164,7 @@ impl Network for TestNetwork {
 impl TestNetwork {
   async fn new(
     validators: usize,
+    start_time: u64,
   ) -> Arc<RwLock<Vec<(MessageSender<Self>, SyncedBlockSender<Self>, SyncedBlockResultReceiver)>>>
   {
     let arc = Arc::new(RwLock::new(vec![]));
@@ -164,13 +174,15 @@ impl TestNetwork {
         let i = u16::try_from(i).unwrap();
         let TendermintHandle { messages, synced_block, synced_block_result, machine } =
           TendermintMachine::new(
+            MemDb::new(),
             TestNetwork(i, arc.clone()),
+            [0; 32],
             BlockNumber(1),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            start_time,
             TestBlock { id: 1u32.to_le_bytes(), valid: Ok(()) },
           )
           .await;
-        tokio::task::spawn(machine.run());
+        tokio::spawn(machine.run());
         write.push((messages, synced_block, synced_block_result));
       }
     }
@@ -179,7 +191,13 @@ impl TestNetwork {
 }
 
 #[tokio::test]
-async fn test() {
-  TestNetwork::new(4).await;
+async fn test_machine() {
+  TestNetwork::new(4, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()).await;
+  sleep(Duration::from_secs(30)).await;
+}
+
+#[tokio::test]
+async fn test_machine_with_historic_start_time() {
+  TestNetwork::new(4, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 60).await;
   sleep(Duration::from_secs(30)).await;
 }

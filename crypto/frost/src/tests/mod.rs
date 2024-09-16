@@ -12,7 +12,7 @@ use crate::{
 
 /// Tests for the nonce handling code.
 pub mod nonces;
-use nonces::{test_multi_nonce, test_invalid_commitment, test_invalid_dleq_proof};
+use nonces::test_multi_nonce;
 
 /// Vectorized test suite to ensure consistency.
 pub mod vectors;
@@ -39,7 +39,7 @@ pub fn clone_without<K: Clone + core::cmp::Eq + core::hash::Hash, V: Clone>(
 /// Spawn algorithm machines for a random selection of signers, each executing the given algorithm.
 pub fn algorithm_machines<R: RngCore, C: Curve, A: Algorithm<C>>(
   rng: &mut R,
-  algorithm: A,
+  algorithm: &A,
   keys: &HashMap<Participant, ThresholdKeys<C>>,
 ) -> HashMap<Participant, AlgorithmMachine<C, A>> {
   let mut included = vec![];
@@ -167,7 +167,7 @@ pub fn sign_without_caching<R: RngCore + CryptoRng, M: PreprocessMachine>(
 /// successfully.
 pub fn sign<R: RngCore + CryptoRng, M: PreprocessMachine>(
   rng: &mut R,
-  params: <M::SignMachine as SignMachine<M::Signature>>::Params,
+  params: &<M::SignMachine as SignMachine<M::Signature>>::Params,
   mut keys: HashMap<Participant, <M::SignMachine as SignMachine<M::Signature>>::Keys>,
   machines: HashMap<Participant, M>,
   msg: &[u8],
@@ -177,13 +177,13 @@ pub fn sign<R: RngCore + CryptoRng, M: PreprocessMachine>(
     machines,
     |rng, machines| {
       // Cache and rebuild half of the machines
-      let included = machines.keys().cloned().collect::<Vec<_>>();
+      let included = machines.keys().copied().collect::<Vec<_>>();
       for i in included {
         if (rng.next_u64() % 2) == 0 {
           let cache = machines.remove(&i).unwrap().cache();
           machines.insert(
             i,
-            M::SignMachine::from_cache(params.clone(), keys.remove(&i).unwrap(), cache).unwrap(),
+            M::SignMachine::from_cache(params.clone(), keys.remove(&i).unwrap(), cache).0,
           );
         }
       }
@@ -195,12 +195,12 @@ pub fn sign<R: RngCore + CryptoRng, M: PreprocessMachine>(
 /// Test a basic Schnorr signature with the provided keys.
 pub fn test_schnorr_with_keys<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(
   rng: &mut R,
-  keys: HashMap<Participant, ThresholdKeys<C>>,
+  keys: &HashMap<Participant, ThresholdKeys<C>>,
 ) {
   const MSG: &[u8] = b"Hello, World!";
 
-  let machines = algorithm_machines(&mut *rng, IetfSchnorr::<C, H>::ietf(), &keys);
-  let sig = sign(&mut *rng, IetfSchnorr::<C, H>::ietf(), keys.clone(), machines, MSG);
+  let machines = algorithm_machines(&mut *rng, &IetfSchnorr::<C, H>::ietf(), keys);
+  let sig = sign(&mut *rng, &IetfSchnorr::<C, H>::ietf(), keys.clone(), machines, MSG);
   let group_key = keys[&Participant::new(1).unwrap()].group_key();
   assert!(sig.verify(group_key, H::hram(&sig.R, &group_key, MSG)));
 }
@@ -208,13 +208,13 @@ pub fn test_schnorr_with_keys<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(
 /// Test a basic Schnorr signature.
 pub fn test_schnorr<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(rng: &mut R) {
   let keys = key_gen(&mut *rng);
-  test_schnorr_with_keys::<_, _, H>(&mut *rng, keys)
+  test_schnorr_with_keys::<_, _, H>(&mut *rng, &keys)
 }
 
 /// Test a basic Schnorr signature, yet with MuSig.
 pub fn test_musig_schnorr<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(rng: &mut R) {
   let keys = musig_key_gen(&mut *rng);
-  test_schnorr_with_keys::<_, _, H>(&mut *rng, keys)
+  test_schnorr_with_keys::<_, _, H>(&mut *rng, &keys)
 }
 
 /// Test an offset Schnorr signature.
@@ -231,8 +231,8 @@ pub fn test_offset_schnorr<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(rng: &m
     assert_eq!(keys.group_key(), offset_key);
   }
 
-  let machines = algorithm_machines(&mut *rng, IetfSchnorr::<C, H>::ietf(), &keys);
-  let sig = sign(&mut *rng, IetfSchnorr::<C, H>::ietf(), keys.clone(), machines, MSG);
+  let machines = algorithm_machines(&mut *rng, &IetfSchnorr::<C, H>::ietf(), &keys);
+  let sig = sign(&mut *rng, &IetfSchnorr::<C, H>::ietf(), keys.clone(), machines, MSG);
   let group_key = keys[&Participant::new(1).unwrap()].group_key();
   assert!(sig.verify(offset_key, H::hram(&sig.R, &group_key, MSG)));
 }
@@ -242,7 +242,7 @@ pub fn test_schnorr_blame<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(rng: &mu
   const MSG: &[u8] = b"Hello, World!";
 
   let keys = key_gen(&mut *rng);
-  let machines = algorithm_machines(&mut *rng, IetfSchnorr::<C, H>::ietf(), &keys);
+  let machines = algorithm_machines(&mut *rng, &IetfSchnorr::<C, H>::ietf(), &keys);
 
   let (mut machines, shares) = preprocess_and_shares(&mut *rng, machines, |_, _| {}, MSG);
 
@@ -267,6 +267,4 @@ pub fn test_ciphersuite<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(rng: &mut 
   test_schnorr_blame::<R, C, H>(rng);
 
   test_multi_nonce::<R, C>(rng);
-  test_invalid_commitment::<R, C>(rng);
-  test_invalid_dleq_proof::<R, C>(rng);
 }

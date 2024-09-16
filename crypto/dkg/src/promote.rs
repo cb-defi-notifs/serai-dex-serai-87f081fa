@@ -19,7 +19,7 @@ pub trait CiphersuitePromote<C2: Ciphersuite> {
   fn promote(self) -> ThresholdKeys<C2>;
 }
 
-fn transcript<G: GroupEncoding>(key: G, i: Participant) -> RecommendedTranscript {
+fn transcript<G: GroupEncoding>(key: &G, i: Participant) -> RecommendedTranscript {
   let mut transcript = RecommendedTranscript::new(b"DKG Generator Promotion v0.2");
   transcript.append_message(b"group_key", key.to_bytes());
   transcript.append_message(b"participant", i.to_bytes());
@@ -64,10 +64,7 @@ pub struct GeneratorPromotion<C1: Ciphersuite, C2: Ciphersuite> {
   _c2: PhantomData<C2>,
 }
 
-impl<C1: Ciphersuite, C2: Ciphersuite> GeneratorPromotion<C1, C2>
-where
-  C2: Ciphersuite<F = C1::F, G = C1::G>,
-{
+impl<C1: Ciphersuite, C2: Ciphersuite<F = C1::F, G = C1::G>> GeneratorPromotion<C1, C2> {
   /// Begin promoting keys from one generator to another. Returns a proof this share was properly
   /// promoted.
   pub fn promote<R: RngCore + CryptoRng>(
@@ -79,7 +76,7 @@ where
       share: C2::generator() * base.secret_share().deref(),
       proof: DLEqProof::prove(
         rng,
-        &mut transcript(base.core.group_key(), base.params().i),
+        &mut transcript(&base.core.group_key(), base.params().i),
         &[C1::generator(), C2::generator()],
         base.secret_share(),
       ),
@@ -105,11 +102,11 @@ where
       proof
         .proof
         .verify(
-          &mut transcript(self.base.core.group_key(), i),
+          &mut transcript(&self.base.core.group_key(), i),
           &[C1::generator(), C2::generator()],
           &[original_shares[&i], proof.share],
         )
-        .map_err(|_| DkgError::InvalidProofOfKnowledge(i))?;
+        .map_err(|_| DkgError::InvalidCommitments(i))?;
       verification_shares.insert(i, proof.share);
     }
 

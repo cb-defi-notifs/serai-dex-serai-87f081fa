@@ -125,14 +125,8 @@ impl<C: Curve, A: Algorithm<C>> AlgorithmMachine<C, A> {
     let mut params = self.params;
 
     let mut rng = ChaCha20Rng::from_seed(*seed.0);
-    // Get a challenge to the existing transcript for use when proving for the commitments
-    let commitments_challenge = params.algorithm.transcript().challenge(b"commitments");
-    let (nonces, commitments) = Commitments::new::<_, A::Transcript>(
-      &mut rng,
-      params.keys.secret_share(),
-      &params.algorithm.nonces(),
-      commitments_challenge.as_ref(),
-    );
+    let (nonces, commitments) =
+      Commitments::new::<_>(&mut rng, params.keys.secret_share(), &params.algorithm.nonces());
     let addendum = params.algorithm.preprocess_addendum(&mut rng, &params.keys);
 
     let preprocess = Preprocess { commitments, addendum };
@@ -141,27 +135,18 @@ impl<C: Curve, A: Algorithm<C>> AlgorithmMachine<C, A> {
     let mut blame_entropy = [0; 32];
     rng.fill_bytes(&mut blame_entropy);
     (
-      AlgorithmSignMachine {
-        params,
-        seed,
-        commitments_challenge,
-        nonces,
-        preprocess: preprocess.clone(),
-        blame_entropy,
-      },
+      AlgorithmSignMachine { params, seed, nonces, preprocess: preprocess.clone(), blame_entropy },
       preprocess,
     )
   }
 
   #[cfg(any(test, feature = "tests"))]
   pub(crate) fn unsafe_override_preprocess(
-    mut self,
+    self,
     nonces: Vec<Nonce<C>>,
     preprocess: Preprocess<C, A::Addendum>,
   ) -> AlgorithmSignMachine<C, A> {
     AlgorithmSignMachine {
-      commitments_challenge: self.params.algorithm.transcript().challenge(b"commitments"),
-
       params: self.params,
       seed: CachedPreprocess(Zeroizing::new([0; 32])),
 
@@ -224,13 +209,15 @@ pub trait SignMachine<S>: Send + Sync + Sized {
   /// security as your private key share.
   fn cache(self) -> CachedPreprocess;
 
-  /// Create a sign machine from a cached preprocess. After this, the preprocess must be deleted so
-  /// it's never reused. Any reuse would cause the signer to leak their secret share.
+  /// Create a sign machine from a cached preprocess.
+
+  /// After this, the preprocess must be deleted so it's never reused. Any reuse will presumably
+  /// cause the signer to leak their secret share.
   fn from_cache(
     params: Self::Params,
     keys: Self::Keys,
     cache: CachedPreprocess,
-  ) -> Result<Self, FrostError>;
+  ) -> (Self, Self::Preprocess);
 
   /// Read a Preprocess message. Despite taking self, this does not save the preprocess.
   /// It must be externally cached and passed into sign.
@@ -253,8 +240,6 @@ pub struct AlgorithmSignMachine<C: Curve, A: Algorithm<C>> {
   params: Params<C, A>,
   seed: CachedPreprocess,
 
-  #[zeroize(skip)]
-  commitments_challenge: <A::Transcript as Transcript>::Challenge,
   pub(crate) nonces: Vec<Nonce<C>>,
   // Skips the preprocess due to being too large a bound to feasibly enforce on users
   #[zeroize(skip)]
@@ -277,18 +262,13 @@ impl<C: Curve, A: Algorithm<C>> SignMachine<A::Signature> for AlgorithmSignMachi
     algorithm: A,
     keys: ThresholdKeys<C>,
     cache: CachedPreprocess,
-  ) -> Result<Self, FrostError> {
-    let (machine, _) = AlgorithmMachine::new(algorithm, keys).seeded_preprocess(cache);
-    Ok(machine)
+  ) -> (Self, Self::Preprocess) {
+    AlgorithmMachine::new(algorithm, keys).seeded_preprocess(cache)
   }
 
   fn read_preprocess<R: Read>(&self, reader: &mut R) -> io::Result<Self::Preprocess> {
     Ok(Preprocess {
-      commitments: Commitments::read::<_, A::Transcript>(
-        reader,
-        &self.params.algorithm.nonces(),
-        self.commitments_challenge.as_ref(),
-      )?,
+      commitments: Commitments::read::<_>(reader, &self.params.algorithm.nonces())?,
       addendum: self.params.algorithm.read_addendum(reader)?,
     })
   }
@@ -382,9 +362,7 @@ impl<C: Curve, A: Algorithm<C>> SignMachine<A::Signature> for AlgorithmSignMachi
       rho_transcript.append_message(b"message", C::hash_msg(msg));
       rho_transcript.append_message(
         b"preprocesses",
-        &C::hash_commitments(
-          self.params.algorithm.transcript().challenge(b"preprocesses").as_ref(),
-        ),
+        C::hash_commitments(self.params.algorithm.transcript().challenge(b"preprocesses").as_ref()),
       );
 
       // Generate the per-signer binding factors

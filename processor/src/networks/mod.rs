@@ -1,4 +1,4 @@
-use core::fmt::Debug;
+use core::{fmt::Debug, time::Duration};
 use std::{io, collections::HashMap};
 
 use async_trait::async_trait;
@@ -12,17 +12,26 @@ use frost::{
 
 use serai_client::primitives::{NetworkId, Balance};
 
+use log::error;
+
+use tokio::time::sleep;
+
 #[cfg(feature = "bitcoin")]
 pub mod bitcoin;
 #[cfg(feature = "bitcoin")]
 pub use self::bitcoin::Bitcoin;
+
+#[cfg(feature = "ethereum")]
+pub mod ethereum;
+#[cfg(feature = "ethereum")]
+pub use ethereum::Ethereum;
 
 #[cfg(feature = "monero")]
 pub mod monero;
 #[cfg(feature = "monero")]
 pub use monero::Monero;
 
-use crate::{Payment, Plan};
+use crate::{Payment, Plan, multisigs::scheduler::Scheduler};
 
 #[derive(Clone, Copy, Error, Debug)]
 pub enum NetworkError {
@@ -67,6 +76,9 @@ pub enum OutputType {
 
   // Should be added to the available UTXO pool with no further action
   Change,
+
+  // Forwarded output from the prior multisig
+  Forwarded,
 }
 
 impl OutputType {
@@ -75,6 +87,7 @@ impl OutputType {
       OutputType::External => 0,
       OutputType::Branch => 1,
       OutputType::Change => 2,
+      OutputType::Forwarded => 3,
     }])
   }
 
@@ -85,22 +98,24 @@ impl OutputType {
       0 => OutputType::External,
       1 => OutputType::Branch,
       2 => OutputType::Change,
-      _ => Err(io::Error::new(io::ErrorKind::Other, "invalid OutputType"))?,
+      3 => OutputType::Forwarded,
+      _ => Err(io::Error::other("invalid OutputType"))?,
     })
   }
 }
 
-pub trait Output: Send + Sync + Sized + Clone + PartialEq + Eq + Debug {
+pub trait Output<N: Network>: Send + Sync + Sized + Clone + PartialEq + Eq + Debug {
   type Id: 'static + Id;
 
   fn kind(&self) -> OutputType;
 
   fn id(&self) -> Self::Id;
+  fn tx_id(&self) -> <N::Transaction as Transaction<N>>::Id; // TODO: Review use of
+  fn key(&self) -> <N::Curve as Ciphersuite>::G;
+
+  fn presumed_origin(&self) -> Option<N::Address>;
 
   fn balance(&self) -> Balance;
-  fn amount(&self) -> u64 {
-    self.balance().amount.0
-  }
   fn data(&self) -> &[u8];
 
   fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()>;
@@ -108,20 +123,33 @@ pub trait Output: Send + Sync + Sized + Clone + PartialEq + Eq + Debug {
 }
 
 #[async_trait]
-pub trait Transaction<N: Network>: Send + Sync + Sized + Clone + Debug {
+pub trait Transaction<N: Network>: Send + Sync + Sized + Clone + PartialEq + Debug {
   type Id: 'static + Id;
   fn id(&self) -> Self::Id;
-  fn serialize(&self) -> Vec<u8>;
-
+  // TODO: Move to Balance
   #[cfg(test)]
   async fn fee(&self, network: &N) -> u64;
 }
 
-pub trait Eventuality: Send + Sync + Clone + Debug {
+pub trait SignableTransaction: Send + Sync + Clone + Debug {
+  // TODO: Move to Balance
+  fn fee(&self) -> u64;
+}
+
+pub trait Eventuality: Send + Sync + Clone + PartialEq + Debug {
+  type Claim: Send + Sync + Clone + PartialEq + Default + AsRef<[u8]> + AsMut<[u8]> + Debug;
+  type Completion: Send + Sync + Clone + PartialEq + Debug;
+
   fn lookup(&self) -> Vec<u8>;
 
   fn read<R: io::Read>(reader: &mut R) -> io::Result<Self>;
   fn serialize(&self) -> Vec<u8>;
+
+  fn claim(completion: &Self::Completion) -> Self::Claim;
+
+  // TODO: Make a dedicated Completion trait
+  fn serialize_completion(completion: &Self::Completion) -> Vec<u8>;
+  fn read_completion<R: io::Read>(reader: &mut R) -> io::Result<Self::Completion>;
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -171,13 +199,16 @@ impl<E: Eventuality> Default for EventualitiesTracker<E> {
   }
 }
 
+#[async_trait]
 pub trait Block<N: Network>: Send + Sync + Sized + Clone + Debug {
-  // This is currently bounded to being 32-bytes.
+  // This is currently bounded to being 32 bytes.
   type Id: 'static + Id;
   fn id(&self) -> Self::Id;
   fn parent(&self) -> Self::Id;
-  fn time(&self) -> u64;
-  fn median_fee(&self) -> N::Fee;
+  /// The monotonic network time at this block.
+  ///
+  /// This call is presumed to be expensive and should only be called sparingly.
+  async fn time(&self, rpc: &N) -> u64;
 }
 
 // The post-fee value of an expected branch.
@@ -187,101 +218,53 @@ pub struct PostFeeBranch {
 }
 
 // Return the PostFeeBranches needed when dropping a transaction
-pub fn drop_branches<N: Network>(plan: &Plan<N>) -> Vec<PostFeeBranch> {
+fn drop_branches<N: Network>(
+  key: <N::Curve as Ciphersuite>::G,
+  payments: &[Payment<N>],
+) -> Vec<PostFeeBranch> {
   let mut branch_outputs = vec![];
-  for payment in &plan.payments {
-    if payment.address == N::branch_address(plan.key) {
-      branch_outputs.push(PostFeeBranch { expected: payment.amount, actual: None });
+  for payment in payments {
+    if Some(&payment.address) == N::branch_address(key).as_ref() {
+      branch_outputs.push(PostFeeBranch { expected: payment.balance.amount.0, actual: None });
     }
   }
   branch_outputs
 }
 
-// Amortize a fee over the plan's payments
-pub fn amortize_fee<N: Network>(plan: &mut Plan<N>, tx_fee: u64) -> Vec<PostFeeBranch> {
-  // No payments to amortize over
-  if plan.payments.is_empty() {
-    return vec![];
-  }
-
-  let original_outputs = plan.payments.iter().map(|payment| payment.amount).sum::<u64>();
-
-  // Amortize the transaction fee across outputs
-  let mut payments_len = u64::try_from(plan.payments.len()).unwrap();
-  // Use a formula which will round up
-  let per_output_fee = |payments| (tx_fee + (payments - 1)) / payments;
-
-  let post_fee = |payment: &Payment<N>, per_output_fee| {
-    let mut post_fee = payment.amount.checked_sub(per_output_fee);
-    // If this is under our dust threshold, drop it
-    if let Some(amount) = post_fee {
-      if amount < N::DUST {
-        post_fee = None;
-      }
-    }
-    post_fee
-  };
-
-  // If we drop outputs for being less than the fee, we won't successfully reduce the amount spent
-  // (dropping a 800 output due to a 1000 fee leaves 200 we still have to deduct)
-  // Do initial runs until the amount of output we will drop is known
-  while {
-    let last = payments_len;
-    payments_len = u64::try_from(
-      plan
-        .payments
-        .iter()
-        .filter(|payment| post_fee(payment, per_output_fee(payments_len)).is_some())
-        .count(),
-    )
-    .unwrap();
-    last != payments_len
-  } {}
-
-  // Now that we know how many outputs will survive, calculate the actual per_output_fee
-  let per_output_fee = per_output_fee(payments_len);
-  let mut branch_outputs = vec![];
-  for payment in plan.payments.iter_mut() {
-    let post_fee = post_fee(payment, per_output_fee);
-    // Note the branch output, if this is one
-    if payment.address == N::branch_address(plan.key) {
-      branch_outputs.push(PostFeeBranch { expected: payment.amount, actual: post_fee });
-    }
-    payment.amount = post_fee.unwrap_or(0);
-  }
-  // Drop payments now worth 0
-  plan.payments = plan.payments.drain(..).filter(|payment| payment.amount != 0).collect();
-
-  // Sanity check the fee wa successfully amortized
-  let new_outputs = plan.payments.iter().map(|payment| payment.amount).sum::<u64>();
-  assert!((new_outputs + tx_fee) <= original_outputs);
-
-  branch_outputs
+pub struct PreparedSend<N: Network> {
+  /// None for the transaction if the SignableTransaction was dropped due to lack of value.
+  pub tx: Option<(N::SignableTransaction, N::Eventuality)>,
+  pub post_fee_branches: Vec<PostFeeBranch>,
+  /// The updated operating costs after preparing this transaction.
+  pub operating_costs: u64,
 }
 
 #[async_trait]
-pub trait Network: 'static + Send + Sync + Clone + PartialEq + Eq + Debug {
+pub trait Network: 'static + Send + Sync + Clone + PartialEq + Debug {
   /// The elliptic curve used for this network.
   type Curve: Curve;
 
-  /// The type representing the fee for this network.
-  // This should likely be a u64, wrapped in a type which implements appropriate fee logic.
-  type Fee: Copy;
-
   /// The type representing the transaction for this network.
-  type Transaction: Transaction<Self>;
+  type Transaction: Transaction<Self>; // TODO: Review use of
   /// The type representing the block for this network.
   type Block: Block<Self>;
 
   /// The type containing all information on a scanned output.
   // This is almost certainly distinct from the network's native output type.
-  type Output: Output;
+  type Output: Output<Self>;
   /// The type containing all information on a planned transaction, waiting to be signed.
-  type SignableTransaction: Send + Sync + Clone + Debug;
+  type SignableTransaction: SignableTransaction;
   /// The type containing all information to check if a plan was completed.
+  ///
+  /// This must be binding to both the outputs expected and the plan ID.
   type Eventuality: Eventuality;
   /// The FROST machine to sign a transaction.
-  type TransactionMachine: PreprocessMachine<Signature = Self::Transaction>;
+  type TransactionMachine: PreprocessMachine<
+    Signature = <Self::Eventuality as Eventuality>::Completion,
+  >;
+
+  /// The scheduler for this network.
+  type Scheduler: Scheduler<Self>;
 
   /// The type representing an address.
   // This should NOT be a String, yet a tailored type representing an efficient binary encoding,
@@ -300,89 +283,360 @@ pub trait Network: 'static + Send + Sync + Clone + PartialEq + Eq + Debug {
   const NETWORK: NetworkId;
   /// String ID for this network.
   const ID: &'static str;
+  /// The estimated amount of time a block will take.
+  const ESTIMATED_BLOCK_TIME_IN_SECONDS: usize;
   /// The amount of confirmations required to consider a block 'final'.
   const CONFIRMATIONS: usize;
-  /// The maximum amount of inputs which will fit in a TX.
-  /// This should be equal to MAX_OUTPUTS unless one is specifically limited.
-  /// A TX with MAX_INPUTS and MAX_OUTPUTS must not exceed the max size.
-  const MAX_INPUTS: usize;
   /// The maximum amount of outputs which will fit in a TX.
   /// This should be equal to MAX_INPUTS unless one is specifically limited.
   /// A TX with MAX_INPUTS and MAX_OUTPUTS must not exceed the max size.
   const MAX_OUTPUTS: usize;
 
   /// Minimum output value which will be handled.
+  ///
+  /// For any received output, there's the cost to spend the output. This value MUST exceed the
+  /// cost to spend said output, and should by a notable margin (not just 2x, yet an order of
+  /// magnitude).
+  // TODO: Dust needs to be diversified per Coin
   const DUST: u64;
+
+  /// The cost to perform input aggregation with a 2-input 1-output TX.
+  const COST_TO_AGGREGATE: u64;
 
   /// Tweak keys for this network.
   fn tweak_keys(key: &mut ThresholdKeys<Self::Curve>);
 
   /// Address for the given group key to receive external coins to.
-  fn address(key: <Self::Curve as Ciphersuite>::G) -> Self::Address;
+  #[cfg(test)]
+  async fn external_address(&self, key: <Self::Curve as Ciphersuite>::G) -> Self::Address;
   /// Address for the given group key to use for scheduled branches.
-  // This is purely used for debugging purposes. Any output may be used to execute a branch.
-  fn branch_address(key: <Self::Curve as Ciphersuite>::G) -> Self::Address;
+  fn branch_address(key: <Self::Curve as Ciphersuite>::G) -> Option<Self::Address>;
+  /// Address for the given group key to use for change.
+  fn change_address(key: <Self::Curve as Ciphersuite>::G) -> Option<Self::Address>;
+  /// Address for forwarded outputs from prior multisigs.
+  ///
+  /// forward_address must only return None if explicit forwarding isn't necessary.
+  fn forward_address(key: <Self::Curve as Ciphersuite>::G) -> Option<Self::Address>;
 
   /// Get the latest block's number.
   async fn get_latest_block_number(&self) -> Result<usize, NetworkError>;
   /// Get a block by its number.
   async fn get_block(&self, number: usize) -> Result<Self::Block, NetworkError>;
+
+  /// Get the latest block's number, retrying until success.
+  async fn get_latest_block_number_with_retries(&self) -> usize {
+    loop {
+      match self.get_latest_block_number().await {
+        Ok(number) => {
+          return number;
+        }
+        Err(e) => {
+          error!(
+            "couldn't get the latest block number in the with retry get_latest_block_number: {e:?}",
+          );
+          sleep(Duration::from_secs(10)).await;
+        }
+      }
+    }
+  }
+
+  /// Get a block, retrying until success.
+  async fn get_block_with_retries(&self, block_number: usize) -> Self::Block {
+    loop {
+      match self.get_block(block_number).await {
+        Ok(block) => {
+          return block;
+        }
+        Err(e) => {
+          error!("couldn't get block {block_number} in the with retry get_block: {:?}", e);
+          sleep(Duration::from_secs(10)).await;
+        }
+      }
+    }
+  }
+
   /// Get the outputs within a block for a specific key.
   async fn get_outputs(
     &self,
     block: &Self::Block,
     key: <Self::Curve as Ciphersuite>::G,
-  ) -> Result<Vec<Self::Output>, NetworkError>;
+  ) -> Vec<Self::Output>;
 
   /// Get the registered eventualities completed within this block, and any prior blocks which
   /// registered eventualities may have been completed in.
+  ///
+  /// This may panic if not fed a block greater than the tracker's block number.
+  ///
+  /// Plan ID -> (block number, TX ID, completion)
+  // TODO: get_eventuality_completions_internal + provided get_eventuality_completions for common
+  // code
+  // TODO: Consider having this return the Transaction + the Completion?
+  // Or Transaction with extract_completion?
   async fn get_eventuality_completions(
     &self,
     eventualities: &mut EventualitiesTracker<Self::Eventuality>,
     block: &Self::Block,
-  ) -> HashMap<[u8; 32], <Self::Transaction as Transaction<Self>>::Id>;
-
-  /// Prepare a SignableTransaction for a transaction.
-  /// Returns None for the transaction if the SignableTransaction was dropped due to lack of value.
-  #[rustfmt::skip]
-  async fn prepare_send(
-    &self,
-    keys: ThresholdKeys<Self::Curve>,
-    block_number: usize,
-    plan: Plan<Self>,
-    fee: Self::Fee,
-  ) -> Result<
-    (Option<(Self::SignableTransaction, Self::Eventuality)>, Vec<PostFeeBranch>),
-    NetworkError
+  ) -> HashMap<
+    [u8; 32],
+    (
+      usize,
+      <Self::Transaction as Transaction<Self>>::Id,
+      <Self::Eventuality as Eventuality>::Completion,
+    ),
   >;
 
-  /// Attempt to sign a SignableTransaction.
-  async fn attempt_send(
+  /// Returns the needed fee to fulfill this Plan at this fee rate.
+  ///
+  /// Returns None if this Plan isn't fulfillable (such as when the fee exceeds the input value).
+  async fn needed_fee(
     &self,
+    block_number: usize,
+    inputs: &[Self::Output],
+    payments: &[Payment<Self>],
+    change: &Option<Self::Address>,
+  ) -> Result<Option<u64>, NetworkError>;
+
+  /// Create a SignableTransaction for the given Plan.
+  ///
+  /// The expected flow is:
+  /// 1) Call needed_fee
+  /// 2) If the Plan is fulfillable, amortize the fee
+  /// 3) Call signable_transaction *which MUST NOT return None if the above was done properly*
+  ///
+  /// This takes a destructured Plan as some of these arguments are malleated from the original
+  /// Plan.
+  // TODO: Explicit AmortizedPlan?
+  #[allow(clippy::too_many_arguments)]
+  async fn signable_transaction(
+    &self,
+    block_number: usize,
+    plan_id: &[u8; 32],
+    key: <Self::Curve as Ciphersuite>::G,
+    inputs: &[Self::Output],
+    payments: &[Payment<Self>],
+    change: &Option<Self::Address>,
+    scheduler_addendum: &<Self::Scheduler as Scheduler<Self>>::Addendum,
+  ) -> Result<Option<(Self::SignableTransaction, Self::Eventuality)>, NetworkError>;
+
+  /// Prepare a SignableTransaction for a transaction.
+  ///
+  /// This must not persist anything as we will prepare Plans we never intend to execute.
+  async fn prepare_send(
+    &self,
+    block_number: usize,
+    plan: Plan<Self>,
+    operating_costs: u64,
+  ) -> Result<PreparedSend<Self>, NetworkError> {
+    // Sanity check this has at least one output planned
+    assert!((!plan.payments.is_empty()) || plan.change.is_some());
+
+    let plan_id = plan.id();
+    let Plan { key, inputs, mut payments, change, scheduler_addendum } = plan;
+    let theoretical_change_amount = if change.is_some() {
+      inputs.iter().map(|input| input.balance().amount.0).sum::<u64>() -
+        payments.iter().map(|payment| payment.balance.amount.0).sum::<u64>()
+    } else {
+      0
+    };
+
+    let Some(tx_fee) = self.needed_fee(block_number, &inputs, &payments, &change).await? else {
+      // This Plan is not fulfillable
+      // TODO: Have Plan explicitly distinguish payments and branches in two separate Vecs?
+      return Ok(PreparedSend {
+        tx: None,
+        // Have all of its branches dropped
+        post_fee_branches: drop_branches(key, &payments),
+        // This plan expects a change output valued at sum(inputs) - sum(outputs)
+        // Since we can no longer create this change output, it becomes an operating cost
+        // TODO: Look at input restoration to reduce this operating cost
+        operating_costs: operating_costs +
+          if change.is_some() { theoretical_change_amount } else { 0 },
+      });
+    };
+
+    // Amortize the fee over the plan's payments
+    let (post_fee_branches, mut operating_costs) = (|| {
+      // If we're creating a change output, letting us recoup coins, amortize the operating costs
+      // as well
+      let total_fee = tx_fee + if change.is_some() { operating_costs } else { 0 };
+
+      let original_outputs = payments.iter().map(|payment| payment.balance.amount.0).sum::<u64>();
+      // If this isn't enough for the total fee, drop and move on
+      if original_outputs < total_fee {
+        let mut remaining_operating_costs = operating_costs;
+        if change.is_some() {
+          // Operating costs increase by the TX fee
+          remaining_operating_costs += tx_fee;
+          // Yet decrease by the payments we managed to drop
+          remaining_operating_costs = remaining_operating_costs.saturating_sub(original_outputs);
+        }
+        return (drop_branches(key, &payments), remaining_operating_costs);
+      }
+
+      let initial_payment_amounts =
+        payments.iter().map(|payment| payment.balance.amount.0).collect::<Vec<_>>();
+
+      // Amortize the transaction fee across outputs
+      let mut remaining_fee = total_fee;
+      // Run as many times as needed until we can successfully subtract this fee
+      while remaining_fee != 0 {
+        // This shouldn't be a / by 0 as these payments have enough value to cover the fee
+        let this_iter_fee = remaining_fee / u64::try_from(payments.len()).unwrap();
+        let mut overage = remaining_fee % u64::try_from(payments.len()).unwrap();
+        for payment in &mut payments {
+          let this_payment_fee = this_iter_fee + overage;
+          // Only subtract the overage once
+          overage = 0;
+
+          let subtractable = payment.balance.amount.0.min(this_payment_fee);
+          remaining_fee -= subtractable;
+          payment.balance.amount.0 -= subtractable;
+        }
+      }
+
+      // If any payment is now below the dust threshold, set its value to 0 so it'll be dropped
+      for payment in &mut payments {
+        if payment.balance.amount.0 < Self::DUST {
+          payment.balance.amount.0 = 0;
+        }
+      }
+
+      // Note the branch outputs' new values
+      let mut branch_outputs = vec![];
+      for (initial_amount, payment) in initial_payment_amounts.into_iter().zip(&payments) {
+        if Some(&payment.address) == Self::branch_address(key).as_ref() {
+          branch_outputs.push(PostFeeBranch {
+            expected: initial_amount,
+            actual: if payment.balance.amount.0 == 0 {
+              None
+            } else {
+              Some(payment.balance.amount.0)
+            },
+          });
+        }
+      }
+
+      // Drop payments now worth 0
+      payments = payments
+        .drain(..)
+        .filter(|payment| {
+          if payment.balance.amount.0 != 0 {
+            true
+          } else {
+            log::debug!("dropping dust payment from plan {}", hex::encode(plan_id));
+            false
+          }
+        })
+        .collect();
+
+      // Sanity check the fee was successfully amortized
+      let new_outputs = payments.iter().map(|payment| payment.balance.amount.0).sum::<u64>();
+      assert!((new_outputs + total_fee) <= original_outputs);
+
+      (
+        branch_outputs,
+        if change.is_none() {
+          // If the change is None, this had no effect on the operating costs
+          operating_costs
+        } else {
+          // Since the change is some, and we successfully amortized, the operating costs were
+          // recouped
+          0
+        },
+      )
+    })();
+
+    let Some(tx) = self
+      .signable_transaction(
+        block_number,
+        &plan_id,
+        key,
+        &inputs,
+        &payments,
+        &change,
+        &scheduler_addendum,
+      )
+      .await?
+    else {
+      panic!(
+        "{}. {}: {}, {}: {:?}, {}: {:?}, {}: {:?}, {}: {}, {}: {:?}",
+        "signable_transaction returned None for a TX we prior successfully calculated the fee for",
+        "id",
+        hex::encode(plan_id),
+        "inputs",
+        inputs,
+        "post-amortization payments",
+        payments,
+        "change",
+        change,
+        "successfully amoritized fee",
+        tx_fee,
+        "scheduler's addendum",
+        scheduler_addendum,
+      )
+    };
+
+    if change.is_some() {
+      let on_chain_expected_change =
+        inputs.iter().map(|input| input.balance().amount.0).sum::<u64>() -
+          payments.iter().map(|payment| payment.balance.amount.0).sum::<u64>() -
+          tx_fee;
+      // If the change value is less than the dust threshold, it becomes an operating cost
+      // This may be slightly inaccurate as dropping payments may reduce the fee, raising the
+      // change above dust
+      // That's fine since it'd have to be in a very precarious state AND then it's over-eager in
+      // tabulating costs
+      if on_chain_expected_change < Self::DUST {
+        operating_costs += theoretical_change_amount;
+      }
+    }
+
+    Ok(PreparedSend { tx: Some(tx), post_fee_branches, operating_costs })
+  }
+
+  /// Attempt to sign a SignableTransaction.
+  async fn attempt_sign(
+    &self,
+    keys: ThresholdKeys<Self::Curve>,
     transaction: Self::SignableTransaction,
   ) -> Result<Self::TransactionMachine, NetworkError>;
 
-  /// Publish a transaction.
-  async fn publish_transaction(&self, tx: &Self::Transaction) -> Result<(), NetworkError>;
-
-  /// Get a transaction by its ID.
-  async fn get_transaction(
+  /// Publish a completion.
+  async fn publish_completion(
     &self,
-    id: &<Self::Transaction as Transaction<Self>>::Id,
-  ) -> Result<Self::Transaction, NetworkError>;
+    completion: &<Self::Eventuality as Eventuality>::Completion,
+  ) -> Result<(), NetworkError>;
 
-  /// Confirm a plan was completed by the specified transaction.
-  // This is allowed to take shortcuts.
-  // This may assume an honest multisig, solely checking the inputs specified were spent.
-  // This may solely check the outputs are equivalent *so long as it's locked to the plan ID*.
-  fn confirm_completion(&self, eventuality: &Self::Eventuality, tx: &Self::Transaction) -> bool;
+  /// Confirm a plan was completed by the specified transaction, per our bounds.
+  ///
+  /// Returns Err if there was an error with the confirmation methodology.
+  /// Returns Ok(None) if this is not a valid completion.
+  /// Returns Ok(Some(_)) with the completion if it's valid.
+  async fn confirm_completion(
+    &self,
+    eventuality: &Self::Eventuality,
+    claim: &<Self::Eventuality as Eventuality>::Claim,
+  ) -> Result<Option<<Self::Eventuality as Eventuality>::Completion>, NetworkError>;
 
   /// Get a block's number by its ID.
   #[cfg(test)]
   async fn get_block_number(&self, id: &<Self::Block as Block<Self>>::Id) -> usize;
 
+  /// Check an Eventuality is fulfilled by a claim.
   #[cfg(test)]
-  async fn get_fee(&self) -> Self::Fee;
+  async fn check_eventuality_by_claim(
+    &self,
+    eventuality: &Self::Eventuality,
+    claim: &<Self::Eventuality as Eventuality>::Claim,
+  ) -> bool;
+
+  /// Get a transaction by the Eventuality it completes.
+  #[cfg(test)]
+  async fn get_transaction_by_eventuality(
+    &self,
+    block: usize,
+    eventuality: &Self::Eventuality,
+  ) -> Self::Transaction;
 
   #[cfg(test)]
   async fn mine_block(&self);
@@ -391,4 +645,11 @@ pub trait Network: 'static + Send + Sync + Clone + PartialEq + Eq + Debug {
   /// Additionally mines enough blocks so that the TX is past the confirmation depth.
   #[cfg(test)]
   async fn test_send(&self, key: Self::Address) -> Self::Block;
+}
+
+pub trait UtxoNetwork: Network {
+  /// The maximum amount of inputs which will fit in a TX.
+  /// This should be equal to MAX_OUTPUTS unless one is specifically limited.
+  /// A TX with MAX_INPUTS and MAX_OUTPUTS must not exceed the max size.
+  const MAX_INPUTS: usize;
 }

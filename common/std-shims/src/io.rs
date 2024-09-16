@@ -28,6 +28,10 @@ mod shims {
       Error { kind, error: Box::new(error) }
     }
 
+    pub fn other<E: 'static + Send + Sync>(error: E) -> Error {
+      Error { kind: ErrorKind::Other, error: Box::new(error) }
+    }
+
     pub fn kind(&self) -> ErrorKind {
       self.kind
     }
@@ -57,6 +61,20 @@ mod shims {
       buf[.. read].copy_from_slice(&self[.. read]);
       *self = &self[read ..];
       Ok(read)
+    }
+  }
+
+  pub trait BufRead: Read {
+    fn fill_buf(&mut self) -> Result<&[u8]>;
+    fn consume(&mut self, amt: usize);
+  }
+
+  impl BufRead for &[u8] {
+    fn fill_buf(&mut self) -> Result<&[u8]> {
+      Ok(*self)
+    }
+    fn consume(&mut self, amt: usize) {
+      *self = &self[amt ..];
     }
   }
 

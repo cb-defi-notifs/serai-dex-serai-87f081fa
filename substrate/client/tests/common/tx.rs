@@ -2,16 +2,16 @@ use core::time::Duration;
 
 use tokio::time::sleep;
 
-use serai_client::subxt::utils::Encoded;
-
-use crate::common::serai;
+use serai_client::{Transaction, Serai};
 
 #[allow(dead_code)]
-pub async fn publish_tx(tx: &Encoded) -> [u8; 32] {
-  let serai = serai().await;
-
-  let mut latest =
-    serai.get_block(serai.get_latest_block_hash().await.unwrap()).await.unwrap().unwrap().number();
+pub async fn publish_tx(serai: &Serai, tx: &Transaction) -> [u8; 32] {
+  let mut latest = serai
+    .block(serai.latest_finalized_block_hash().await.unwrap())
+    .await
+    .unwrap()
+    .unwrap()
+    .number();
 
   serai.publish(tx).await.unwrap();
 
@@ -24,7 +24,7 @@ pub async fn publish_tx(tx: &Encoded) -> [u8; 32] {
     let block = {
       let mut block;
       while {
-        block = serai.get_block_by_number(latest).await.unwrap();
+        block = serai.finalized_block_by_number(latest).await.unwrap();
         block.is_none()
       } {
         sleep(Duration::from_secs(1)).await;
@@ -37,8 +37,8 @@ pub async fn publish_tx(tx: &Encoded) -> [u8; 32] {
       block.unwrap()
     };
 
-    for transaction in block.transactions() {
-      if transaction.0 == tx.0[2 ..] {
+    for transaction in &block.transactions {
+      if transaction == tx {
         return block.hash();
       }
     }

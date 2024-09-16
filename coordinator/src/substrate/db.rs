@@ -1,36 +1,32 @@
+use serai_client::primitives::NetworkId;
+
 pub use serai_db::*;
 
-#[derive(Debug)]
-pub struct SubstrateDb<D: Db>(pub D);
-impl<D: Db> SubstrateDb<D> {
-  pub fn new(db: D) -> Self {
-    Self(db)
-  }
+mod inner_db {
+  use super::*;
 
-  fn substrate_key(dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-    D::key(b"SUBSTRATE", dst, key)
-  }
+  create_db!(
+    SubstrateDb {
+      NextBlock: () -> u64,
+      HandledEvent: (block: [u8; 32]) -> u32,
+      BatchInstructionsHashDb: (network: NetworkId, id: u32) -> [u8; 32]
+    }
+  );
+}
+pub(crate) use inner_db::{NextBlock, BatchInstructionsHashDb};
 
-  fn block_key() -> Vec<u8> {
-    Self::substrate_key(b"block", [])
+pub struct HandledEvent;
+impl HandledEvent {
+  fn next_to_handle_event(getter: &impl Get, block: [u8; 32]) -> u32 {
+    inner_db::HandledEvent::get(getter, block).map_or(0, |last| last + 1)
   }
-  pub fn set_next_block(&mut self, block: u64) {
-    let mut txn = self.0.txn();
-    txn.put(Self::block_key(), block.to_le_bytes());
-    txn.commit();
+  pub fn is_unhandled(getter: &impl Get, block: [u8; 32], event_id: u32) -> bool {
+    let next = Self::next_to_handle_event(getter, block);
+    assert!(next >= event_id);
+    next == event_id
   }
-  pub fn next_block(&self) -> u64 {
-    u64::from_le_bytes(self.0.get(Self::block_key()).unwrap_or(vec![0; 8]).try_into().unwrap())
-  }
-
-  fn event_key(id: &[u8], index: u32) -> Vec<u8> {
-    Self::substrate_key(b"event", [id, index.to_le_bytes().as_ref()].concat())
-  }
-  pub fn handled_event<G: Get>(getter: &G, id: [u8; 32], index: u32) -> bool {
-    getter.get(Self::event_key(&id, index)).is_some()
-  }
-  pub fn handle_event(txn: &mut D::Transaction<'_>, id: [u8; 32], index: u32) {
-    assert!(!Self::handled_event(txn, id, index));
-    txn.put(Self::event_key(&id, index), []);
+  pub fn handle_event(txn: &mut impl DbTxn, block: [u8; 32], index: u32) {
+    assert!(Self::next_to_handle_event(txn, block) == index);
+    inner_db::HandledEvent::set(txn, block, &index);
   }
 }

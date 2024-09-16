@@ -1,8 +1,8 @@
 use core::ops::Deref;
-use std::{io, collections::HashMap};
+use std::{sync::Arc, io};
 
 use zeroize::Zeroizing;
-use rand::{RngCore, CryptoRng};
+use rand::{RngCore, CryptoRng, rngs::OsRng};
 
 use blake2::{Digest, Blake2s256};
 
@@ -12,10 +12,24 @@ use ciphersuite::{
 };
 use schnorr::SchnorrSignature;
 
-use crate::{ReadWrite, Signed, TransactionError, TransactionKind, Transaction, verify_transaction};
+use scale::Encode;
+
+use ::tendermint::{
+  ext::{Network, Signer as SignerTrait, SignatureScheme, BlockNumber, RoundNumber},
+  SignedMessageFor, DataFor, Message, SignedMessage, Data, Evidence,
+};
+
+use crate::{
+  transaction::{Signed, TransactionError, TransactionKind, Transaction, verify_transaction},
+  ReadWrite,
+  tendermint::{tx::TendermintTx, Validators, Signer},
+};
 
 #[cfg(test)]
 mod signed;
+
+#[cfg(test)]
+mod tendermint;
 
 pub fn random_signed<R: RngCore + CryptoRng>(rng: &mut R) -> Signed {
   Signed {
@@ -26,6 +40,12 @@ pub fn random_signed<R: RngCore + CryptoRng>(rng: &mut R) -> Signed {
       s: <Ristretto as Ciphersuite>::F::random(rng),
     },
   }
+}
+
+pub fn random_signed_with_nonce<R: RngCore + CryptoRng>(rng: &mut R, nonce: u32) -> Signed {
+  let mut signed = random_signed(rng);
+  signed.nonce = nonce;
+  signed
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -48,7 +68,11 @@ impl ReadWrite for ProvidedTransaction {
 
 impl Transaction for ProvidedTransaction {
   fn kind(&self) -> TransactionKind<'_> {
-    TransactionKind::Provided("provided")
+    match self.0[0] {
+      1 => TransactionKind::Provided("order1"),
+      2 => TransactionKind::Provided("order2"),
+      _ => panic!("unknown order"),
+    }
   }
 
   fn hash(&self) -> [u8; 32] {
@@ -60,9 +84,17 @@ impl Transaction for ProvidedTransaction {
   }
 }
 
-pub fn random_provided_transaction<R: RngCore + CryptoRng>(rng: &mut R) -> ProvidedTransaction {
+pub fn random_provided_transaction<R: RngCore + CryptoRng>(
+  rng: &mut R,
+  order: &str,
+) -> ProvidedTransaction {
   let mut data = vec![0; 512];
   rng.fill_bytes(&mut data);
+  data[0] = match order {
+    "order1" => 1,
+    "order2" => 2,
+    _ => panic!("unknown order"),
+  };
   ProvidedTransaction(data)
 }
 
@@ -88,7 +120,7 @@ impl ReadWrite for SignedTransaction {
 
 impl Transaction for SignedTransaction {
   fn kind(&self) -> TransactionKind<'_> {
-    TransactionKind::Signed(&self.1)
+    TransactionKind::Signed(vec![], &self.1)
   }
 
   fn hash(&self) -> [u8; 32] {
@@ -119,9 +151,7 @@ pub fn signed_transaction<R: RngCore + CryptoRng>(
   tx.1.signature.R = Ristretto::generator() * sig_nonce.deref();
   tx.1.signature = SchnorrSignature::sign(key, sig_nonce, tx.sig_hash(genesis));
 
-  let mut nonces = HashMap::from([(signer, nonce)]);
-  verify_transaction(&tx, genesis, &mut nonces).unwrap();
-  assert_eq!(nonces, HashMap::from([(tx.1.signer, tx.1.nonce.wrapping_add(1))]));
+  verify_transaction(&tx, genesis, &mut |_, _| Some(tx.1.nonce)).unwrap();
 
   tx
 }
@@ -137,4 +167,54 @@ pub fn random_signed_transaction<R: RngCore + CryptoRng>(
   let nonce = u32::try_from(rng.next_u64() >> 32 >> 1).unwrap();
 
   (genesis, signed_transaction(rng, genesis, &key, nonce))
+}
+
+pub fn new_genesis() -> [u8; 32] {
+  let mut genesis = [0; 32];
+  OsRng.fill_bytes(&mut genesis);
+  genesis
+}
+
+pub async fn tendermint_meta() -> ([u8; 32], Signer, [u8; 32], Arc<Validators>) {
+  // signer
+  let genesis = new_genesis();
+  let signer =
+    Signer::new(genesis, Zeroizing::new(<Ristretto as Ciphersuite>::F::random(&mut OsRng)));
+  let validator_id = signer.validator_id().await.unwrap();
+
+  // schema
+  let signer_pub =
+    <Ristretto as Ciphersuite>::read_G::<&[u8]>(&mut validator_id.as_slice()).unwrap();
+  let validators = Arc::new(Validators::new(genesis, vec![(signer_pub, 1)]).unwrap());
+
+  (genesis, signer, validator_id, validators)
+}
+
+pub async fn signed_from_data<N: Network>(
+  signer: <N::SignatureScheme as SignatureScheme>::Signer,
+  signer_id: N::ValidatorId,
+  block_number: u64,
+  round_number: u32,
+  data: DataFor<N>,
+) -> SignedMessageFor<N> {
+  let msg = Message {
+    sender: signer_id,
+    block: BlockNumber(block_number),
+    round: RoundNumber(round_number),
+    data,
+  };
+  let sig = signer.sign(&msg.encode()).await;
+  SignedMessage { msg, sig }
+}
+
+pub async fn random_evidence_tx<N: Network>(
+  signer: <N::SignatureScheme as SignatureScheme>::Signer,
+  b: N::Block,
+) -> TendermintTx {
+  // Creates a TX with an invalid valid round number
+  // TODO: Use a random failure reason
+  let data = Data::Proposal(Some(RoundNumber(0)), b);
+  let signer_id = signer.validator_id().await.unwrap();
+  let signed = signed_from_data::<N>(signer, signer_id, 0, 0, data).await;
+  TendermintTx::SlashEvidence(Evidence::InvalidValidRound(signed.encode()))
 }

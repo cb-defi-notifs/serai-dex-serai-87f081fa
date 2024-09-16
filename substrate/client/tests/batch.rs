@@ -1,20 +1,27 @@
 use rand_core::{RngCore, OsRng};
 
+use blake2::{
+  digest::{consts::U32, Digest},
+  Blake2b,
+};
+
+use scale::Encode;
+
 use serai_client::{
   primitives::{Amount, NetworkId, Coin, Balance, BlockHash, SeraiAddress},
   in_instructions::{
     primitives::{InInstruction, InInstructionWithBalance, Batch},
     InInstructionsEvent,
   },
-  tokens::TokensEvent,
+  coins::CoinsEvent,
   Serai,
 };
 
 mod common;
-use common::{serai, in_instructions::provide_batch};
+use common::in_instructions::provide_batch;
 
 serai_test!(
-  async fn publish_batch() {
+  publish_batch: (|serai: Serai| async move {
     let network = NetworkId::Bitcoin;
     let id = 0;
 
@@ -38,18 +45,31 @@ serai_test!(
       }],
     };
 
-    let block = provide_batch(batch).await;
+    let block = provide_batch(&serai, batch.clone()).await;
 
-    let serai = serai().await;
-    assert_eq!(serai.get_latest_block_for_network(block, network).await.unwrap(), Some(block_hash));
-    let batches = serai.get_batch_events(block).await.unwrap();
-    assert_eq!(batches, vec![InInstructionsEvent::Batch { network, id, block: block_hash }]);
+    let serai = serai.as_of(block);
+    {
+      let serai = serai.in_instructions();
+      let latest_finalized = serai.latest_block_for_network(network).await.unwrap();
+      assert_eq!(latest_finalized, Some(block_hash));
+      let batches = serai.batch_events().await.unwrap();
+      assert_eq!(
+        batches,
+        vec![InInstructionsEvent::Batch {
+          network,
+          id,
+          block: block_hash,
+          instructions_hash: Blake2b::<U32>::digest(batch.instructions.encode()).into(),
+        }]
+      );
+    }
 
+    let serai = serai.coins();
     assert_eq!(
-      serai.get_mint_events(block).await.unwrap(),
-      vec![TokensEvent::Mint { address, balance }],
+      serai.mint_events().await.unwrap(),
+      vec![CoinsEvent::Mint { to: address, balance }]
     );
-    assert_eq!(serai.get_token_supply(block, coin).await.unwrap(), amount);
-    assert_eq!(serai.get_token_balance(block, coin, address).await.unwrap(), amount);
-  }
+    assert_eq!(serai.coin_supply(coin).await.unwrap(), amount);
+    assert_eq!(serai.coin_balance(coin, address).await.unwrap(), amount);
+  })
 );

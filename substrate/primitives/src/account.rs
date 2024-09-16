@@ -1,6 +1,9 @@
 #[cfg(feature = "std")]
 use zeroize::Zeroize;
 
+#[cfg(feature = "borsh")]
+use borsh::{BorshSerialize, BorshDeserialize};
+#[cfg(feature = "serde")]
 use serde::{Serialize, Deserialize};
 
 use scale::{Encode, Decode, MaxEncodedLen};
@@ -15,22 +18,45 @@ use sp_runtime::traits::{LookupError, Lookup, StaticLookup};
 
 pub type PublicKey = Public;
 
+#[cfg(feature = "borsh")]
+pub fn borsh_serialize_public<W: borsh::io::Write>(
+  public: &Public,
+  writer: &mut W,
+) -> Result<(), borsh::io::Error> {
+  borsh::BorshSerialize::serialize(&public.0, writer)
+}
+
+#[cfg(feature = "borsh")]
+pub fn borsh_deserialize_public<R: borsh::io::Read>(
+  reader: &mut R,
+) -> Result<Public, borsh::io::Error> {
+  let public: [u8; 32] = borsh::BorshDeserialize::deserialize_reader(reader)?;
+  Ok(Public(public))
+}
+
+#[cfg(feature = "borsh")]
+pub fn borsh_serialize_signature<W: borsh::io::Write>(
+  signature: &Signature,
+  writer: &mut W,
+) -> Result<(), borsh::io::Error> {
+  borsh::BorshSerialize::serialize(&signature.0, writer)
+}
+
+#[cfg(feature = "borsh")]
+pub fn borsh_deserialize_signature<R: borsh::io::Read>(
+  reader: &mut R,
+) -> Result<Signature, borsh::io::Error> {
+  let signature: [u8; 64] = borsh::BorshDeserialize::deserialize_reader(reader)?;
+  Ok(Signature(signature))
+}
+
+// TODO: Remove this for solely Public?
 #[derive(
-  Clone,
-  Copy,
-  PartialEq,
-  Eq,
-  PartialOrd,
-  Ord,
-  Debug,
-  Serialize,
-  Deserialize,
-  Encode,
-  Decode,
-  MaxEncodedLen,
-  TypeInfo,
+  Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Encode, Decode, MaxEncodedLen, TypeInfo,
 )]
 #[cfg_attr(feature = "std", derive(Zeroize))]
+#[cfg_attr(feature = "borsh", derive(BorshSerialize, BorshDeserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SeraiAddress(pub [u8; 32]);
 impl SeraiAddress {
   pub fn new(key: [u8; 32]) -> SeraiAddress {
@@ -88,7 +114,7 @@ impl StaticLookup for AccountLookup {
   }
 }
 
-pub const fn pallet_address(pallet: &'static [u8]) -> SeraiAddress {
+pub const fn system_address(pallet: &'static [u8]) -> SeraiAddress {
   let mut address = [0; 32];
   let mut set = false;
   // Implement a while loop since we can't use a for loop

@@ -1,72 +1,109 @@
 use std::collections::HashMap;
 
+use serai_abi::primitives::NetworkId;
 use zeroize::Zeroizing;
 use rand_core::OsRng;
 
-use sp_core::{Pair, sr25519::Signature};
+use sp_core::{
+  sr25519::{Pair, Signature},
+  Pair as PairTrait,
+};
 
-use ciphersuite::{group::GroupEncoding, Ciphersuite, Ristretto};
+use ciphersuite::{Ciphersuite, Ristretto};
 use frost::dkg::musig::musig;
 use schnorrkel::Schnorrkel;
 
 use serai_client::{
-  primitives::insecure_pair_from_name,
   validator_sets::{
-    primitives::{ValidatorSet, KeyPair, musig_context, musig_key, set_keys_message},
+    primitives::{ValidatorSet, KeyPair, musig_context, set_keys_message},
     ValidatorSetsEvent,
   },
-  Serai,
+  Amount, Serai, SeraiValidatorSets,
 };
 
-use crate::common::{serai, tx::publish_tx};
+use crate::common::tx::publish_tx;
 
 #[allow(dead_code)]
-pub async fn set_validator_set_keys(set: ValidatorSet, key_pair: KeyPair) -> [u8; 32] {
-  let pair = insecure_pair_from_name("Alice");
-  let public = pair.public();
+pub async fn set_keys(
+  serai: &Serai,
+  set: ValidatorSet,
+  key_pair: KeyPair,
+  pairs: &[Pair],
+) -> [u8; 32] {
+  let mut pub_keys = vec![];
+  for pair in pairs {
+    let public_key =
+      <Ristretto as Ciphersuite>::read_G::<&[u8]>(&mut pair.public().0.as_ref()).unwrap();
+    pub_keys.push(public_key);
+  }
 
-  let serai = serai().await;
-  let public_key = <Ristretto as Ciphersuite>::read_G::<&[u8]>(&mut public.0.as_ref()).unwrap();
-  assert_eq!(
-    serai.get_validator_set_musig_key(set).await.unwrap().unwrap(),
-    musig_key(set, &[public]).0
-  );
+  let mut threshold_keys = vec![];
+  for i in 0 .. pairs.len() {
+    let secret_key = <Ristretto as Ciphersuite>::read_F::<&[u8]>(
+      &mut pairs[i].as_ref().secret.to_bytes()[.. 32].as_ref(),
+    )
+    .unwrap();
+    assert_eq!(Ristretto::generator() * secret_key, pub_keys[i]);
 
-  let secret_key = <Ristretto as Ciphersuite>::read_F::<&[u8]>(
-    &mut pair.as_ref().secret.to_bytes()[.. 32].as_ref(),
-  )
-  .unwrap();
-  assert_eq!(Ristretto::generator() * secret_key, public_key);
-  let threshold_keys =
-    musig::<Ristretto>(&musig_context(set), &Zeroizing::new(secret_key), &[public_key]).unwrap();
-  assert_eq!(
-    serai.get_validator_set_musig_key(set).await.unwrap().unwrap(),
-    threshold_keys.group_key().to_bytes()
-  );
+    threshold_keys.push(
+      musig::<Ristretto>(&musig_context(set), &Zeroizing::new(secret_key), &pub_keys).unwrap(),
+    );
+  }
+
+  let mut musig_keys = HashMap::new();
+  for tk in threshold_keys {
+    musig_keys.insert(tk.params().i(), tk.into());
+  }
 
   let sig = frost::tests::sign_without_caching(
     &mut OsRng,
-    frost::tests::algorithm_machines(
-      &mut OsRng,
-      Schnorrkel::new(b"substrate"),
-      &HashMap::from([(threshold_keys.params().i(), threshold_keys.into())]),
-    ),
-    &set_keys_message(&set, &key_pair),
+    frost::tests::algorithm_machines(&mut OsRng, &Schnorrkel::new(b"substrate"), &musig_keys),
+    &set_keys_message(&set, &[], &key_pair),
   );
 
-  // Vote in a key pair
-  let block = publish_tx(&Serai::set_validator_set_keys(
-    set.network,
-    key_pair.clone(),
-    Signature(sig.to_bytes()),
-  ))
+  // Set the key pair
+  let block = publish_tx(
+    serai,
+    &SeraiValidatorSets::set_keys(
+      set.network,
+      vec![].try_into().unwrap(),
+      key_pair.clone(),
+      Signature(sig.to_bytes()),
+    ),
+  )
   .await;
 
   assert_eq!(
-    serai.get_key_gen_events(block).await.unwrap(),
+    serai.as_of(block).validator_sets().key_gen_events().await.unwrap(),
     vec![ValidatorSetsEvent::KeyGen { set, key_pair: key_pair.clone() }]
   );
-  assert_eq!(serai.get_keys(set).await.unwrap(), Some(key_pair));
+  assert_eq!(serai.as_of(block).validator_sets().keys(set).await.unwrap(), Some(key_pair));
 
   block
+}
+
+#[allow(dead_code)]
+pub async fn allocate_stake(
+  serai: &Serai,
+  network: NetworkId,
+  amount: Amount,
+  pair: &Pair,
+  nonce: u32,
+) -> [u8; 32] {
+  // get the call
+  let tx = serai.sign(pair, SeraiValidatorSets::allocate(network, amount), nonce, 0);
+  publish_tx(serai, &tx).await
+}
+
+#[allow(dead_code)]
+pub async fn deallocate_stake(
+  serai: &Serai,
+  network: NetworkId,
+  amount: Amount,
+  pair: &Pair,
+  nonce: u32,
+) -> [u8; 32] {
+  // get the call
+  let tx = serai.sign(pair, SeraiValidatorSets::deallocate(network, amount), nonce, 0);
+  publish_tx(serai, &tx).await
 }

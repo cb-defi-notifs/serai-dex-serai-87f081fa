@@ -50,6 +50,7 @@ pub trait Transcript: Send + Clone {
   fn rng_seed(&mut self, label: &'static [u8]) -> [u8; 32];
 }
 
+#[derive(Clone, Copy)]
 enum DigestTranscriptMember {
   Name,
   Domain,
@@ -149,7 +150,7 @@ where
 
     // block_size returns the block_size in bytes
     // Use a ceil div in case the block size isn't evenly divisible by our word size
-    let words = (D::block_size() + (WORD_SIZE - 1)) / WORD_SIZE;
+    let words = D::block_size().div_ceil(WORD_SIZE);
     for _ in 0 .. (2 * words) {
       self.0.update([255; WORD_SIZE]);
     }

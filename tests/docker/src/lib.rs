@@ -7,6 +7,22 @@ use std::{
   process::Command,
 };
 
+pub fn fresh_logs_folder(first: bool, label: &str) -> String {
+  let logs_path = [std::env::current_dir().unwrap().to_str().unwrap(), ".test-logs", label]
+    .iter()
+    .collect::<std::path::PathBuf>();
+  if first {
+    let _ = fs::remove_dir_all(&logs_path);
+    fs::create_dir_all(&logs_path).expect("couldn't create logs directory");
+    assert!(
+      fs::read_dir(&logs_path).expect("couldn't read the logs folder").next().is_none(),
+      "logs folder wasn't empty, despite removing it at the start of the run",
+    );
+  }
+  logs_path.to_str().unwrap().to_string()
+}
+
+// TODO: Merge this with what's in serai-orchestrator/have serai-orchestrator perform building
 static BUILT: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 pub fn build(name: String) {
   let built = BUILT.get_or_init(|| Mutex::new(HashMap::new()));
@@ -27,8 +43,59 @@ pub fn build(name: String) {
   assert!(repo_path.as_path().ends_with("target"));
   repo_path.pop();
 
+  // Run the orchestrator to ensure the most recent files exist
+  if !Command::new("cargo")
+    .current_dir(&repo_path)
+    .arg("run")
+    .arg("-p")
+    .arg("serai-orchestrator")
+    .arg("--")
+    .arg("key_gen")
+    .arg("dev")
+    .spawn()
+    .unwrap()
+    .wait()
+    .unwrap()
+    .success()
+  {
+    panic!("failed to run the orchestrator");
+  }
+
+  if !Command::new("cargo")
+    .current_dir(&repo_path)
+    .arg("run")
+    .arg("-p")
+    .arg("serai-orchestrator")
+    .arg("--")
+    .arg("setup")
+    .arg("dev")
+    .spawn()
+    .unwrap()
+    .wait()
+    .unwrap()
+    .success()
+  {
+    panic!("failed to run the orchestrator");
+  }
+
   let mut orchestration_path = repo_path.clone();
   orchestration_path.push("orchestration");
+  if name != "runtime" {
+    orchestration_path.push("dev");
+  }
+
+  let mut dockerfile_path = orchestration_path.clone();
+  if HashSet::from(["bitcoin", "ethereum", "ethereum-relayer", "monero"]).contains(name.as_str()) {
+    dockerfile_path = dockerfile_path.join("networks");
+  }
+  if name.contains("-processor") {
+    dockerfile_path =
+      dockerfile_path.join("processor").join(name.split('-').next().unwrap()).join("Dockerfile");
+  } else if name == "serai-fast-epoch" {
+    dockerfile_path = dockerfile_path.join("serai").join("Dockerfile.fast-epoch");
+  } else {
+    dockerfile_path = dockerfile_path.join(&name).join("Dockerfile");
+  }
 
   // If this Docker image was created after this repo was last edited, return here
   // This should have better performance than Docker and allows running while offline
@@ -50,31 +117,27 @@ pub fn build(name: String) {
           .0,
       );
 
-      let mut dockerfile_path = orchestration_path.clone();
-      if HashSet::from(["bitcoin", "ethereum", "monero"]).contains(name.as_str()) {
-        dockerfile_path = dockerfile_path.join("coins");
-      }
-      dockerfile_path = dockerfile_path.join(&name).join("Dockerfile");
-
       // For all services, if the Dockerfile was edited after the image was built we should rebuild
       let mut last_modified =
-        fs::metadata(dockerfile_path).ok().and_then(|meta| meta.modified().ok());
+        fs::metadata(&dockerfile_path).ok().and_then(|meta| meta.modified().ok());
 
       // Check any additionally specified paths
       let meta = |path: PathBuf| (path.clone(), fs::metadata(path));
       let mut metadatas = match name.as_str() {
-        "bitcoin" => vec![],
-        "monero" => vec![],
+        "bitcoin" | "ethereum" | "monero" => vec![],
+        "ethereum-relayer" => {
+          vec![meta(repo_path.join("common")), meta(repo_path.join("networks"))]
+        }
         "message-queue" => vec![
           meta(repo_path.join("common")),
           meta(repo_path.join("crypto")),
           meta(repo_path.join("substrate").join("primitives")),
           meta(repo_path.join("message-queue")),
         ],
-        "processor" => vec![
+        "bitcoin-processor" | "ethereum-processor" | "monero-processor" => vec![
           meta(repo_path.join("common")),
           meta(repo_path.join("crypto")),
-          meta(repo_path.join("coins")),
+          meta(repo_path.join("networks")),
           meta(repo_path.join("substrate")),
           meta(repo_path.join("message-queue")),
           meta(repo_path.join("processor")),
@@ -82,17 +145,12 @@ pub fn build(name: String) {
         "coordinator" => vec![
           meta(repo_path.join("common")),
           meta(repo_path.join("crypto")),
-          meta(repo_path.join("coins")),
+          meta(repo_path.join("networks")),
           meta(repo_path.join("substrate")),
           meta(repo_path.join("message-queue")),
           meta(repo_path.join("coordinator")),
         ],
-        "runtime" => vec![
-          meta(repo_path.join("common")),
-          meta(repo_path.join("crypto")),
-          meta(repo_path.join("substrate")),
-        ],
-        "serai" => vec![
+        "runtime" | "serai" | "serai-fast-epoch" => vec![
           meta(repo_path.join("common")),
           meta(repo_path.join("crypto")),
           meta(repo_path.join("substrate")),
@@ -125,7 +183,7 @@ pub fn build(name: String) {
 
       if let Some(last_modified) = last_modified {
         if last_modified < created_time {
-          println!("{} was built after the most recent source code edits, assuming built.", name);
+          println!("{name} was built after the most recent source code edits, assuming built.");
           built_lock.insert(name, true);
           return;
         }
@@ -137,10 +195,13 @@ pub fn build(name: String) {
 
   // Version which always prints
   if !Command::new("docker")
-    .current_dir(orchestration_path)
-    .arg("compose")
+    .current_dir(&repo_path)
     .arg("build")
-    .arg(&name)
+    .arg("-f")
+    .arg(dockerfile_path)
+    .arg(".")
+    .arg("-t")
+    .arg(format!("serai-dev-{name}"))
     .spawn()
     .unwrap()
     .wait()
@@ -153,10 +214,11 @@ pub fn build(name: String) {
   // Version which only prints on error
   /*
   let res = Command::new("docker")
-    .current_dir(orchestration_path)
-    .arg("compose")
+    .current_dir(dockerfile_path)
     .arg("build")
-    .arg(&name)
+    .arg(".")
+    .arg("-t")
+    .arg(format!("serai-dev-{name}"))
     .output()
     .unwrap();
   if !res.status.success() {

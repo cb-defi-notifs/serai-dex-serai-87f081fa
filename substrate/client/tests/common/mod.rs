@@ -1,89 +1,131 @@
-use lazy_static::lazy_static;
-
-use tokio::sync::Mutex;
-
-use serai_client::Serai;
-
 pub mod tx;
 pub mod validator_sets;
 pub mod in_instructions;
-
-pub const URL: &str = "ws://127.0.0.1:9944";
-
-pub async fn serai() -> Serai {
-  Serai::new(URL).await.unwrap()
-}
-
-lazy_static! {
-  pub static ref SEQUENTIAL: Mutex<()> = Mutex::new(());
-}
+pub mod dex;
+pub mod genesis_liquidity;
 
 #[macro_export]
 macro_rules! serai_test {
-  ($(async fn $name: ident() $body: block)*) => {
+  ($($name: ident: $test: expr)*) => {
     $(
       #[tokio::test]
       async fn $name() {
-        use std::process::Command;
+        use std::collections::HashMap;
+        use dockertest::{
+          PullPolicy, StartPolicy, LogOptions, LogAction, LogPolicy, LogSource, Image,
+          TestBodySpecification, DockerTest,
+        };
 
-        let guard = common::SEQUENTIAL.lock().await;
+        serai_docker_tests::build("serai".to_string());
 
-        let is_running = || {
-          !(
-            if let Ok(res) = Command::new("pidof").arg("serai-node").output() {
-              res
-            } else {
-              Command::new("pgrep")
-                .arg("serai-node")
-                .output()
-                .expect("neither pidof nor pgrep were available")
+        let handle = concat!("serai_client-serai_node-", stringify!($name));
+
+        let composition = TestBodySpecification::with_image(
+          Image::with_repository("serai-dev-serai").pull_policy(PullPolicy::Never),
+        )
+        .replace_cmd(vec![
+          "serai-node".to_string(),
+          "--dev".to_string(),
+          "--unsafe-rpc-external".to_string(),
+          "--rpc-cors".to_string(),
+          "all".to_string(),
+        ])
+        .replace_env(
+          HashMap::from([
+            ("RUST_LOG".to_string(), "runtime=debug".to_string()),
+            ("KEY".to_string(), " ".to_string()),
+          ])
+        )
+        .set_publish_all_ports(true)
+        .set_handle(handle)
+        .set_start_policy(StartPolicy::Strict)
+        .set_log_options(Some(LogOptions {
+          action: LogAction::Forward,
+          policy: LogPolicy::Always,
+          source: LogSource::Both,
+        }));
+
+        let mut test = DockerTest::new().with_network(dockertest::Network::Isolated);
+        test.provide_container(composition);
+        test.run_async(|ops| async move {
+          // Sleep until the Substrate RPC starts
+          let serai_rpc = ops.handle(handle).host_port(9944).unwrap();
+          let serai_rpc = format!("http://{}:{}", serai_rpc.0, serai_rpc.1);
+          // Bound execution to 60 seconds
+          for _ in 0 .. 60 {
+            tokio::time::sleep(core::time::Duration::from_secs(1)).await;
+            let Ok(client) = Serai::new(serai_rpc.clone()).await else { continue };
+            if client.latest_finalized_block_hash().await.is_err() {
+              continue;
             }
-          ).stdout.is_empty()
+            break;
+          }
+          #[allow(clippy::redundant_closure_call)]
+          $test(Serai::new(serai_rpc).await.unwrap()).await;
+        }).await;
+      }
+    )*
+  }
+}
+
+#[macro_export]
+macro_rules! serai_test_fast_epoch {
+  ($($name: ident: $test: expr)*) => {
+    $(
+      #[tokio::test]
+      async fn $name() {
+        use std::collections::HashMap;
+        use dockertest::{
+          PullPolicy, StartPolicy, LogOptions, LogAction, LogPolicy, LogSource, Image,
+          TestBodySpecification, DockerTest,
         };
 
-        // Spawn a fresh Serai node
-        let mut command = {
-          use core::time::Duration;
-          use std::path::Path;
+        serai_docker_tests::build("serai-fast-epoch".to_string());
 
-          // Make sure a node isn't already running
-          assert!(!is_running());
+        let handle = concat!("serai_client-serai_node-", stringify!($name));
 
-          let node = {
-            let this_crate = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let top_level = this_crate.join("../../");
-            top_level.join("target/debug/serai-node")
-          };
+        let composition = TestBodySpecification::with_image(
+          Image::with_repository("serai-dev-serai-fast-epoch").pull_policy(PullPolicy::Never),
+        )
+        .replace_cmd(vec![
+          "serai-node".to_string(),
+          "--dev".to_string(),
+          "--unsafe-rpc-external".to_string(),
+          "--rpc-cors".to_string(),
+          "all".to_string(),
+        ])
+        .replace_env(
+          HashMap::from([
+            ("RUST_LOG".to_string(), "runtime=debug".to_string()),
+            ("KEY".to_string(), " ".to_string()),
+          ])
+        )
+        .set_publish_all_ports(true)
+        .set_handle(handle)
+        .set_start_policy(StartPolicy::Strict)
+        .set_log_options(Some(LogOptions {
+          action: LogAction::Forward,
+          policy: LogPolicy::Always,
+          source: LogSource::Both,
+        }));
 
-          let command = Command::new(node).arg("--dev").spawn().unwrap();
-          while Serai::new(common::URL).await.is_err() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut test = DockerTest::new().with_network(dockertest::Network::Isolated);
+        test.provide_container(composition);
+        test.run_async(|ops| async move {
+          // Sleep until the Substrate RPC starts
+          let serai_rpc = ops.handle(handle).host_port(9944).unwrap();
+          let serai_rpc = format!("http://{}:{}", serai_rpc.0, serai_rpc.1);
+          // Bound execution to 60 seconds
+          for _ in 0 .. 60 {
+            tokio::time::sleep(core::time::Duration::from_secs(1)).await;
+            let Ok(client) = Serai::new(serai_rpc.clone()).await else { continue };
+            if client.latest_finalized_block_hash().await.is_err() {
+              continue;
+            }
+            break;
           }
-          let serai = serai().await;
-          while serai.get_latest_block_hash().await.is_err() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-          }
-          // TODO: https://github.com/serai-dex/serai/247
-          if std::env::var("GITHUB_CI") == Ok("true".to_string()) {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-          }
-
-          // Sanity check the pidof command is well-formed
-          assert!(is_running());
-
-          command
-        };
-
-        let local = tokio::task::LocalSet::new();
-        local.run_until(async move {
-          if let Err(err) = tokio::task::spawn_local(async move { $body }).await {
-            drop(guard);
-            let _ = command.kill();
-            Err(err).unwrap()
-          } else {
-            command.kill().unwrap();
-          }
-          assert!(!is_running());
+          #[allow(clippy::redundant_closure_call)]
+          $test(Serai::new(serai_rpc).await.unwrap()).await;
         }).await;
       }
     )*

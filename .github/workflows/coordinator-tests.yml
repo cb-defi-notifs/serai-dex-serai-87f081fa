@@ -7,11 +7,10 @@ on:
     paths:
       - "common/**"
       - "crypto/**"
-      - "coins/**"
+      - "networks/**"
       - "message-queue/**"
-      - "orchestration/message-queue/**"
       - "coordinator/**"
-      - "orchestration/coordinator/**"
+      - "orchestration/**"
       - "tests/docker/**"
       - "tests/coordinator/**"
 
@@ -19,11 +18,10 @@ on:
     paths:
       - "common/**"
       - "crypto/**"
-      - "coins/**"
+      - "networks/**"
       - "message-queue/**"
-      - "orchestration/message-queue/**"
       - "coordinator/**"
-      - "orchestration/coordinator/**"
+      - "orchestration/**"
       - "tests/docker/**"
       - "tests/coordinator/**"
 
@@ -33,12 +31,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
 
       - name: Install Build Dependencies
         uses: ./.github/actions/build-dependencies
-        with:
-          github-token: ${{ inputs.github-token }}
 
       - name: Run coordinator Docker tests
-        run: cd tests/coordinator && GITHUB_CI=true cargo test
+        run: GITHUB_CI=true RUST_BACKTRACE=1 cargo test --all-features -p serai-coordinator-tests

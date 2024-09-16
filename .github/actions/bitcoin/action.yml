@@ -5,14 +5,14 @@ inputs:
   version:
     description: "Version to download and run"
     required: false
-    default: 24.0.1
+    default: "27.0"
 
 runs:
   using: "composite"
   steps:
     - name: Bitcoin Daemon Cache
       id: cache-bitcoind
-      uses: actions/cache@v3
+      uses: actions/cache@13aacd865c20de90d75de3b17ebe84f7a17d57d2
       with:
         path: bitcoin.tar.gz
         key: bitcoind-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
@@ -37,11 +37,4 @@ runs:
 
     - name: Bitcoin Regtest Daemon
       shell: bash
-      run: |
-        RPC_USER=serai
-        RPC_PASS=seraidex
-
-        bitcoind -txindex -regtest \
-          -rpcuser=$RPC_USER -rpcpassword=$RPC_PASS \
-          -rpcbind=127.0.0.1 -rpcbind=$(hostname) -rpcallowip=0.0.0.0/0 \
-          -daemon
+      run: PATH=$PATH:/usr/bin ./orchestration/dev/networks/bitcoin/run.sh -daemon

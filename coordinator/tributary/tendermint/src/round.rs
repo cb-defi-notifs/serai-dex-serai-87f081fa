@@ -4,8 +4,8 @@ use std::{
   collections::HashMap,
 };
 
-use futures::{FutureExt, future};
-use tokio::time::sleep;
+use futures_util::{FutureExt, future};
+use patchable_async_sleep::sleep;
 
 use crate::{
   time::CanonicalInstant,
@@ -13,16 +13,16 @@ use crate::{
   ext::{RoundNumber, Network},
 };
 
-pub(crate) struct RoundData<N: Network> {
+pub struct RoundData<N: Network> {
   _network: PhantomData<N>,
-  pub(crate) number: RoundNumber,
-  pub(crate) start_time: CanonicalInstant,
-  pub(crate) step: Step,
-  pub(crate) timeouts: HashMap<Step, Instant>,
+  pub number: RoundNumber,
+  pub start_time: CanonicalInstant,
+  pub step: Step,
+  pub timeouts: HashMap<Step, Instant>,
 }
 
 impl<N: Network> RoundData<N> {
-  pub(crate) fn new(number: RoundNumber, start_time: CanonicalInstant) -> Self {
+  pub fn new(number: RoundNumber, start_time: CanonicalInstant) -> Self {
     RoundData {
       _network: PhantomData,
       number,
@@ -35,7 +35,7 @@ impl<N: Network> RoundData<N> {
   fn timeout(&self, step: Step) -> CanonicalInstant {
     let adjusted_block = N::BLOCK_PROCESSING_TIME * (self.number.0 + 1);
     let adjusted_latency = N::LATENCY_TIME * (self.number.0 + 1);
-    let offset = Duration::from_secs(
+    let offset = Duration::from_millis(
       (match step {
         Step::Propose => adjusted_block + adjusted_latency,
         Step::Prevote => adjusted_block + (2 * adjusted_latency),
@@ -46,7 +46,7 @@ impl<N: Network> RoundData<N> {
     self.start_time + offset
   }
 
-  pub(crate) fn end_time(&self) -> CanonicalInstant {
+  pub fn end_time(&self) -> CanonicalInstant {
     self.timeout(Step::Precommit)
   }
 
@@ -57,6 +57,16 @@ impl<N: Network> RoundData<N> {
 
   // Poll all set timeouts, returning the Step whose timeout has just expired
   pub(crate) async fn timeout_future(&self) -> Step {
+    /*
+    let now = Instant::now();
+    log::trace!(
+      target: "tendermint",
+      "getting timeout_future, from step {:?}, off timeouts: {:?}",
+      self.step,
+      self.timeouts.iter().map(|(k, v)| (k, v.duration_since(now))).collect::<HashMap<_, _>>()
+    );
+    */
+
     let timeout_future = |step| {
       let timeout = self.timeouts.get(&step).copied();
       (async move {
@@ -72,9 +82,9 @@ impl<N: Network> RoundData<N> {
     let propose_timeout = timeout_future(Step::Propose);
     let prevote_timeout = timeout_future(Step::Prevote);
     let precommit_timeout = timeout_future(Step::Precommit);
-    futures::pin_mut!(propose_timeout, prevote_timeout, precommit_timeout);
+    futures_util::pin_mut!(propose_timeout, prevote_timeout, precommit_timeout);
 
-    futures::select_biased! {
+    futures_util::select_biased! {
       step = propose_timeout => step,
       step = prevote_timeout => step,
       step = precommit_timeout => step,

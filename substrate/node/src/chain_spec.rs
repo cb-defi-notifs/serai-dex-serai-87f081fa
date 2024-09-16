@@ -1,13 +1,13 @@
 use core::marker::PhantomData;
+use std::collections::HashSet;
 
-use sp_core::Pair as PairTrait;
+use sp_core::{Decode, Pair as PairTrait, sr25519::Public};
 
 use sc_service::ChainType;
 
 use serai_runtime::{
-  primitives::*, tokens::primitives::ADDRESS as TOKENS_ADDRESS, WASM_BINARY, opaque::SessionKeys,
-  BABE_GENESIS_EPOCH_CONFIG, RuntimeGenesisConfig, SystemConfig, BalancesConfig, AssetsConfig,
-  ValidatorSetsConfig, SessionConfig, BabeConfig, GrandpaConfig, AuthorityDiscoveryConfig,
+  primitives::*, WASM_BINARY, BABE_GENESIS_EPOCH_CONFIG, RuntimeGenesisConfig, SystemConfig,
+  CoinsConfig, ValidatorSetsConfig, SignalsConfig, BabeConfig, GrandpaConfig, EmissionsConfig,
 };
 
 pub type ChainSpec = sc_service::GenericChainSpec<RuntimeGenesisConfig>;
@@ -16,76 +16,143 @@ fn account_from_name(name: &'static str) -> PublicKey {
   insecure_pair_from_name(name).public()
 }
 
-fn testnet_genesis(
+fn wasm_binary() -> Vec<u8> {
+  // TODO: Accept a config of runtime path
+  const WASM_PATH: &str = "/runtime/serai.wasm";
+  if let Ok(binary) = std::fs::read(WASM_PATH) {
+    log::info!("using {WASM_PATH}");
+    return binary;
+  }
+  log::info!("using built-in wasm");
+  WASM_BINARY.ok_or("compiled in wasm not available").unwrap().to_vec()
+}
+
+fn devnet_genesis(
   wasm_binary: &[u8],
   validators: &[&'static str],
   endowed_accounts: Vec<PublicKey>,
 ) -> RuntimeGenesisConfig {
-  let session_key = |name| {
-    let key = account_from_name(name);
-    (
-      key,
-      key,
-      SessionKeys { babe: key.into(), grandpa: key.into(), authority_discovery: key.into() },
-    )
-  };
+  let validators = validators.iter().map(|name| account_from_name(name)).collect::<Vec<_>>();
+  RuntimeGenesisConfig {
+    system: SystemConfig { code: wasm_binary.to_vec(), _config: PhantomData },
+
+    transaction_payment: Default::default(),
+
+    coins: CoinsConfig {
+      accounts: endowed_accounts
+        .into_iter()
+        .map(|a| (a, Balance { coin: Coin::Serai, amount: Amount(1 << 60) }))
+        .collect(),
+      _ignore: Default::default(),
+    },
+
+    validator_sets: ValidatorSetsConfig {
+      networks: serai_runtime::primitives::NETWORKS
+        .iter()
+        .map(|network| match network {
+          NetworkId::Serai => (NetworkId::Serai, Amount(50_000 * 10_u64.pow(8))),
+          NetworkId::Bitcoin => (NetworkId::Bitcoin, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Ethereum => (NetworkId::Ethereum, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Monero => (NetworkId::Monero, Amount(100_000 * 10_u64.pow(8))),
+        })
+        .collect(),
+      participants: validators.clone(),
+    },
+    emissions: EmissionsConfig {
+      networks: serai_runtime::primitives::NETWORKS
+        .iter()
+        .map(|network| match network {
+          NetworkId::Serai => (NetworkId::Serai, Amount(50_000 * 10_u64.pow(8))),
+          NetworkId::Bitcoin => (NetworkId::Bitcoin, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Ethereum => (NetworkId::Ethereum, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Monero => (NetworkId::Monero, Amount(100_000 * 10_u64.pow(8))),
+        })
+        .collect(),
+      participants: validators.clone(),
+    },
+    signals: SignalsConfig::default(),
+    babe: BabeConfig {
+      authorities: validators.iter().map(|validator| ((*validator).into(), 1)).collect(),
+      epoch_config: Some(BABE_GENESIS_EPOCH_CONFIG),
+      _config: PhantomData,
+    },
+    grandpa: GrandpaConfig {
+      authorities: validators.into_iter().map(|validator| (validator.into(), 1)).collect(),
+      _config: PhantomData,
+    },
+  }
+}
+
+fn testnet_genesis(wasm_binary: &[u8], validators: Vec<&'static str>) -> RuntimeGenesisConfig {
+  let validators = validators
+    .into_iter()
+    .map(|validator| Public::decode(&mut hex::decode(validator).unwrap().as_slice()).unwrap())
+    .collect::<Vec<_>>();
+
+  assert_eq!(validators.iter().collect::<HashSet<_>>().len(), validators.len());
 
   RuntimeGenesisConfig {
     system: SystemConfig { code: wasm_binary.to_vec(), _config: PhantomData },
 
-    balances: BalancesConfig {
-      balances: endowed_accounts.iter().cloned().map(|k| (k, 1 << 60)).collect(),
-    },
     transaction_payment: Default::default(),
 
-    assets: AssetsConfig {
-      assets: [Coin::Bitcoin, Coin::Ether, Coin::Dai, Coin::Monero]
+    coins: CoinsConfig {
+      accounts: validators
         .iter()
-        .map(|coin| (*coin, TOKENS_ADDRESS.into(), true, 1))
+        .map(|a| (*a, Balance { coin: Coin::Serai, amount: Amount(5_000_000 * 10_u64.pow(8)) }))
         .collect(),
-      metadata: vec![
-        (Coin::Bitcoin, b"Bitcoin".to_vec(), b"BTC".to_vec(), 8),
-        // Reduce to 8 decimals to feasibly fit within u64 (instead of its native u256)
-        (Coin::Ether, b"Ether".to_vec(), b"ETH".to_vec(), 8),
-        (Coin::Dai, b"Dai Stablecoin".to_vec(), b"DAI".to_vec(), 8),
-        (Coin::Monero, b"Monero".to_vec(), b"XMR".to_vec(), 12),
-      ],
-      accounts: vec![],
+      _ignore: Default::default(),
     },
 
     validator_sets: ValidatorSetsConfig {
-      bond: Amount(1_000_000 * 10_u64.pow(8)),
-      networks: vec![
-        (NetworkId::Bitcoin, NETWORKS[&NetworkId::Bitcoin].clone()),
-        (NetworkId::Ethereum, NETWORKS[&NetworkId::Ethereum].clone()),
-        (NetworkId::Monero, NETWORKS[&NetworkId::Monero].clone()),
-      ],
-      participants: validators.iter().map(|name| account_from_name(name)).collect(),
+      networks: serai_runtime::primitives::NETWORKS
+        .iter()
+        .map(|network| match network {
+          NetworkId::Serai => (NetworkId::Serai, Amount(50_000 * 10_u64.pow(8))),
+          NetworkId::Bitcoin => (NetworkId::Bitcoin, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Ethereum => (NetworkId::Ethereum, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Monero => (NetworkId::Monero, Amount(100_000 * 10_u64.pow(8))),
+        })
+        .collect(),
+      participants: validators.clone(),
     },
-    session: SessionConfig { keys: validators.iter().map(|name| session_key(*name)).collect() },
+    emissions: EmissionsConfig {
+      networks: serai_runtime::primitives::NETWORKS
+        .iter()
+        .map(|network| match network {
+          NetworkId::Serai => (NetworkId::Serai, Amount(50_000 * 10_u64.pow(8))),
+          NetworkId::Bitcoin => (NetworkId::Bitcoin, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Ethereum => (NetworkId::Ethereum, Amount(1_000_000 * 10_u64.pow(8))),
+          NetworkId::Monero => (NetworkId::Monero, Amount(100_000 * 10_u64.pow(8))),
+        })
+        .collect(),
+      participants: validators.clone(),
+    },
+    signals: SignalsConfig::default(),
     babe: BabeConfig {
-      authorities: vec![],
+      authorities: validators.iter().map(|validator| ((*validator).into(), 1)).collect(),
       epoch_config: Some(BABE_GENESIS_EPOCH_CONFIG),
       _config: PhantomData,
     },
-    grandpa: GrandpaConfig { authorities: vec![], _config: PhantomData },
-
-    authority_discovery: AuthorityDiscoveryConfig { keys: vec![], _config: PhantomData },
+    grandpa: GrandpaConfig {
+      authorities: validators.into_iter().map(|validator| (validator.into(), 1)).collect(),
+      _config: PhantomData,
+    },
   }
 }
 
-pub fn development_config() -> Result<ChainSpec, &'static str> {
-  let wasm_binary = WASM_BINARY.ok_or("Development wasm not available")?;
+pub fn development_config() -> ChainSpec {
+  let wasm_binary = wasm_binary();
 
-  Ok(ChainSpec::from_genesis(
+  ChainSpec::from_genesis(
     // Name
     "Development Network",
     // ID
     "devnet",
     ChainType::Development,
-    || {
-      testnet_genesis(
-        wasm_binary,
+    move || {
+      devnet_genesis(
+        &wasm_binary,
         &["Alice"],
         vec![
           account_from_name("Alice"),
@@ -102,29 +169,29 @@ pub fn development_config() -> Result<ChainSpec, &'static str> {
     // Telemetry
     None,
     // Protocol ID
-    Some("serai"),
+    Some("serai-devnet"),
     // Fork ID
     None,
     // Properties
     None,
     // Extensions
     None,
-  ))
+  )
 }
 
-pub fn testnet_config() -> Result<ChainSpec, &'static str> {
-  let wasm_binary = WASM_BINARY.ok_or("Testnet wasm not available")?;
+pub fn local_config() -> ChainSpec {
+  let wasm_binary = wasm_binary();
 
-  Ok(ChainSpec::from_genesis(
+  ChainSpec::from_genesis(
     // Name
     "Local Test Network",
     // ID
     "local",
     ChainType::Local,
-    || {
-      testnet_genesis(
-        wasm_binary,
-        &["Alice", "Bob", "Charlie"],
+    move || {
+      devnet_genesis(
+        &wasm_binary,
+        &["Alice", "Bob", "Charlie", "Dave"],
         vec![
           account_from_name("Alice"),
           account_from_name("Bob"),
@@ -140,12 +207,48 @@ pub fn testnet_config() -> Result<ChainSpec, &'static str> {
     // Telemetry
     None,
     // Protocol ID
-    Some("serai"),
+    Some("serai-local"),
     // Fork ID
     None,
     // Properties
     None,
     // Extensions
     None,
-  ))
+  )
+}
+
+pub fn testnet_config() -> ChainSpec {
+  let wasm_binary = wasm_binary();
+
+  ChainSpec::from_genesis(
+    // Name
+    "Test Network 2",
+    // ID
+    "testnet-2",
+    ChainType::Live,
+    move || {
+      let _ = testnet_genesis(&wasm_binary, vec![]);
+      todo!()
+    },
+    // Bootnodes
+    vec![],
+    // Telemetry
+    None,
+    // Protocol ID
+    Some("serai-testnet-2"),
+    // Fork ID
+    None,
+    // Properties
+    None,
+    // Extensions
+    None,
+  )
+}
+
+pub fn bootnode_multiaddrs(id: &str) -> Vec<libp2p::Multiaddr> {
+  match id {
+    "devnet" | "local" => vec![],
+    "testnet-2" => todo!(),
+    _ => panic!("unrecognized network ID"),
+  }
 }

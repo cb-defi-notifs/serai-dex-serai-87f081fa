@@ -4,14 +4,14 @@ use dkg::{Participant, ThresholdParams, tests::clone_without};
 
 use serai_client::{
   primitives::{NetworkId, BlockHash, PublicKey},
-  validator_sets::primitives::{Session, KeyPair, ValidatorSet},
+  validator_sets::primitives::{Session, KeyPair},
 };
 
 use messages::{SubstrateContext, key_gen::KeyGenId, CoordinatorMessage, ProcessorMessage};
 
 use crate::{*, tests::*};
 
-pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId) -> KeyPair {
+pub(crate) async fn key_gen(coordinators: &mut [Coordinator]) -> KeyPair {
   // Perform an interaction with all processors via their coordinators
   async fn interact_with_all<
     FS: Fn(Participant) -> messages::key_gen::CoordinatorMessage,
@@ -33,7 +33,7 @@ pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId
   }
 
   // Order a key gen
-  let id = KeyGenId { set: ValidatorSet { session: Session(0), network }, attempt: 0 };
+  let id = KeyGenId { session: Session(0), attempt: 0 };
 
   let mut commitments = HashMap::new();
   interact_with_all(
@@ -46,14 +46,16 @@ pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId
         participant,
       )
       .unwrap(),
+      shares: 1,
     },
     |participant, msg| match msg {
       messages::key_gen::ProcessorMessage::Commitments {
         id: this_id,
-        commitments: these_commitments,
+        commitments: mut these_commitments,
       } => {
         assert_eq!(this_id, id);
-        commitments.insert(participant, these_commitments);
+        assert_eq!(these_commitments.len(), 1);
+        commitments.insert(participant, these_commitments.swap_remove(0));
       }
       _ => panic!("processor didn't return Commitments in response to GenerateKey"),
     },
@@ -69,9 +71,10 @@ pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId
       commitments: clone_without(&commitments, &participant),
     },
     |participant, msg| match msg {
-      messages::key_gen::ProcessorMessage::Shares { id: this_id, shares: these_shares } => {
+      messages::key_gen::ProcessorMessage::Shares { id: this_id, shares: mut these_shares } => {
         assert_eq!(this_id, id);
-        shares.insert(participant, these_shares);
+        assert_eq!(these_shares.len(), 1);
+        shares.insert(participant, these_shares.swap_remove(0));
       }
       _ => panic!("processor didn't return Shares in response to GenerateKey"),
     },
@@ -85,12 +88,12 @@ pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId
     coordinators,
     |participant| messages::key_gen::CoordinatorMessage::Shares {
       id,
-      shares: shares
+      shares: vec![shares
         .iter()
         .filter_map(|(this_participant, shares)| {
           shares.get(&participant).cloned().map(|share| (*this_participant, share))
         })
-        .collect(),
+        .collect()],
     },
     |_, msg| match msg {
       messages::key_gen::ProcessorMessage::GeneratedKeyPair {
@@ -112,22 +115,24 @@ pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId
   .await;
 
   // Confirm the key pair
-  // TODO: Beter document network_latest_finalized_block's genesis state, and error if a set claims
+  // TODO: Better document network_latest_finalized_block's genesis state, and error if a set claims
   // [0; 32] was finalized
   let context = SubstrateContext {
     serai_time: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
     network_latest_finalized_block: BlockHash([0; 32]),
   };
 
-  let key_pair =
-    (PublicKey::from_raw(substrate_key.unwrap()), network_key.clone().unwrap().try_into().unwrap());
+  let key_pair = KeyPair(
+    PublicKey::from_raw(substrate_key.unwrap()),
+    network_key.clone().unwrap().try_into().unwrap(),
+  );
 
   for coordinator in coordinators {
     coordinator
       .send_message(CoordinatorMessage::Substrate(
         messages::substrate::CoordinatorMessage::ConfirmKeyPair {
           context,
-          set: id.set,
+          session: id.session,
           key_pair: key_pair.clone(),
         },
       ))
@@ -139,7 +144,7 @@ pub(crate) async fn key_gen(coordinators: &mut [Coordinator], network: NetworkId
 
 #[test]
 fn key_gen_test() {
-  for network in [NetworkId::Bitcoin, NetworkId::Monero] {
+  for network in [NetworkId::Bitcoin, NetworkId::Ethereum, NetworkId::Monero] {
     let (coordinators, test) = new_test(network);
 
     test.run(|ops| async move {
@@ -153,7 +158,7 @@ fn key_gen_test() {
         .map(|(handles, key)| Coordinator::new(network, &ops, handles, key))
         .collect::<Vec<_>>();
 
-      key_gen(&mut coordinators, network).await;
+      key_gen(&mut coordinators).await;
     });
   }
 }

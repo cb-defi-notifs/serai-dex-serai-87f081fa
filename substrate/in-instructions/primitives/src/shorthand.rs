@@ -1,6 +1,9 @@
 #[cfg(feature = "std")]
 use zeroize::Zeroize;
 
+#[cfg(feature = "borsh")]
+use borsh::{BorshSerialize, BorshDeserialize};
+#[cfg(feature = "serde")]
 use serde::{Serialize, Deserialize};
 
 use scale::{Encode, Decode, MaxEncodedLen};
@@ -8,16 +11,16 @@ use scale_info::TypeInfo;
 
 use serai_primitives::{Coin, Amount, SeraiAddress, ExternalAddress};
 
-use tokens_primitives::OutInstruction;
+use coins_primitives::OutInstruction;
 
 use crate::RefundableInInstruction;
 #[cfg(feature = "std")]
 use crate::InInstruction;
 
-#[derive(
-  Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Encode, Decode, MaxEncodedLen, TypeInfo,
-)]
+#[derive(Clone, PartialEq, Eq, Debug, Encode, Decode, MaxEncodedLen, TypeInfo)]
 #[cfg_attr(feature = "std", derive(Zeroize))]
+#[cfg_attr(feature = "borsh", derive(BorshSerialize, BorshDeserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Shorthand {
   Raw(RefundableInInstruction),
   Swap {
@@ -26,7 +29,7 @@ pub enum Shorthand {
     minimum: Amount,
     out: OutInstruction,
   },
-  AddLiquidity {
+  SwapAndAddLiquidity {
     origin: Option<ExternalAddress>,
     minimum: Amount,
     gas: Amount,
@@ -47,7 +50,7 @@ impl TryFrom<Shorthand> for RefundableInInstruction {
     Ok(match shorthand {
       Shorthand::Raw(instruction) => instruction,
       Shorthand::Swap { .. } => todo!(),
-      Shorthand::AddLiquidity { .. } => todo!(),
+      Shorthand::SwapAndAddLiquidity { .. } => todo!(),
     })
   }
 }

@@ -1,8 +1,11 @@
-use std::time::{Duration, SystemTime};
+use std::{
+  time::{Duration, SystemTime},
+  collections::HashSet,
+};
 
 use zeroize::Zeroizing;
 use rand_core::{RngCore, CryptoRng, OsRng};
-use futures::{task::Poll, poll};
+use futures_util::{task::Poll, poll};
 
 use ciphersuite::{
   group::{ff::Field, GroupEncoding},
@@ -10,21 +13,22 @@ use ciphersuite::{
 };
 
 use sp_application_crypto::sr25519;
-
+use borsh::BorshDeserialize;
 use serai_client::{
-  primitives::{NETWORKS, NetworkId, Amount},
-  validator_sets::primitives::{Session, ValidatorSet, ValidatorSetData},
+  primitives::NetworkId,
+  validator_sets::primitives::{Session, ValidatorSet},
 };
 
 use tokio::time::sleep;
 
 use serai_db::MemDb;
 
-use tributary::{Transaction as TransactionTrait, Tributary};
+use tributary::Tributary;
 
 use crate::{
-  P2pMessageKind, P2p, LocalP2p,
+  GossipMessageKind, P2pMessageKind, P2p,
   tributary::{Transaction, TributarySpec},
+  tests::LocalP2p,
 };
 
 pub fn new_keys<R: RngCore + CryptoRng>(
@@ -48,35 +52,32 @@ pub fn new_spec<R: RngCore + CryptoRng>(
 
   let set = ValidatorSet { session: Session(0), network: NetworkId::Bitcoin };
 
-  let set_data = ValidatorSetData {
-    bond: Amount(100),
-    network: NETWORKS[&NetworkId::Bitcoin].clone(),
-    participants: keys
-      .iter()
-      .map(|key| {
-        (sr25519::Public((<Ristretto as Ciphersuite>::generator() * **key).to_bytes()), Amount(100))
-      })
-      .collect::<Vec<_>>()
-      .try_into()
-      .unwrap(),
-  };
+  let set_participants = keys
+    .iter()
+    .map(|key| (sr25519::Public((<Ristretto as Ciphersuite>::generator() * **key).to_bytes()), 1))
+    .collect::<Vec<_>>();
 
-  let res = TributarySpec::new(serai_block, start_time, set, set_data);
-  assert_eq!(TributarySpec::read::<&[u8]>(&mut res.serialize().as_ref()).unwrap(), res);
+  let res = TributarySpec::new(serai_block, start_time, set, set_participants);
+  assert_eq!(
+    TributarySpec::deserialize_reader(&mut borsh::to_vec(&res).unwrap().as_slice()).unwrap(),
+    res,
+  );
   res
 }
 
 pub async fn new_tributaries(
   keys: &[Zeroizing<<Ristretto as Ciphersuite>::F>],
   spec: &TributarySpec,
-) -> Vec<(LocalP2p, Tributary<MemDb, Transaction, LocalP2p>)> {
+) -> Vec<(MemDb, LocalP2p, Tributary<MemDb, Transaction, LocalP2p>)> {
   let p2p = LocalP2p::new(keys.len());
   let mut res = vec![];
   for (i, key) in keys.iter().enumerate() {
+    let db = MemDb::new();
     res.push((
+      db.clone(),
       p2p[i].clone(),
       Tributary::<_, Transaction, _>::new(
-        MemDb::new(),
+        db,
         spec.genesis(),
         spec.start_time(),
         key.clone(),
@@ -94,10 +95,10 @@ pub async fn run_tributaries(
   mut tributaries: Vec<(LocalP2p, Tributary<MemDb, Transaction, LocalP2p>)>,
 ) {
   loop {
-    for (p2p, tributary) in tributaries.iter_mut() {
+    for (p2p, tributary) in &mut tributaries {
       while let Poll::Ready(msg) = poll!(p2p.receive()) {
         match msg.kind {
-          P2pMessageKind::Tributary(genesis) => {
+          P2pMessageKind::Gossip(GossipMessageKind::Tributary(genesis)) => {
             assert_eq!(genesis, tributary.genesis());
             if tributary.handle_message(&msg.msg).await {
               p2p.broadcast(msg.kind, msg.msg).await;
@@ -156,7 +157,11 @@ async fn tributary_test() {
   let keys = new_keys(&mut OsRng);
   let spec = new_spec(&mut OsRng, &keys);
 
-  let mut tributaries = new_tributaries(&keys, &spec).await;
+  let mut tributaries = new_tributaries(&keys, &spec)
+    .await
+    .into_iter()
+    .map(|(_, p2p, tributary)| (p2p, tributary))
+    .collect::<Vec<_>>();
 
   let mut blocks = 0;
   let mut last_block = spec.genesis();
@@ -165,10 +170,10 @@ async fn tributary_test() {
   // run_tributaries will run them ad infinitum
   let timeout = SystemTime::now() + Duration::from_secs(65);
   while (blocks < 10) && (SystemTime::now().duration_since(timeout).is_err()) {
-    for (p2p, tributary) in tributaries.iter_mut() {
+    for (p2p, tributary) in &mut tributaries {
       while let Poll::Ready(msg) = poll!(p2p.receive()) {
         match msg.kind {
-          P2pMessageKind::Tributary(genesis) => {
+          P2pMessageKind::Gossip(GossipMessageKind::Tributary(genesis)) => {
             assert_eq!(genesis, tributary.genesis());
             tributary.handle_message(&msg.msg).await;
           }
@@ -191,10 +196,10 @@ async fn tributary_test() {
   }
 
   // Handle all existing messages
-  for (p2p, tributary) in tributaries.iter_mut() {
+  for (p2p, tributary) in &mut tributaries {
     while let Poll::Ready(msg) = poll!(p2p.receive()) {
       match msg.kind {
-        P2pMessageKind::Tributary(genesis) => {
+        P2pMessageKind::Gossip(GossipMessageKind::Tributary(genesis)) => {
           assert_eq!(genesis, tributary.genesis());
           tributary.handle_message(&msg.msg).await;
         }
@@ -208,14 +213,25 @@ async fn tributary_test() {
   // TODO: Is there a better way to handle this?
   sleep(Duration::from_secs(1)).await;
 
-  // All tributaries should agree on the tip
-  let mut final_block = None;
-  for (_, tributary) in tributaries {
-    if final_block.is_none() {
-      final_block = Some(tributary.tip().await);
-    }
-    if tributary.tip().await != final_block.unwrap() {
-      panic!("tributary had different tip");
-    }
+  // All tributaries should agree on the tip, within a block
+  let mut tips = HashSet::new();
+  for (_, tributary) in &tributaries {
+    tips.insert(tributary.tip().await);
   }
+  assert!(tips.len() <= 2);
+  if tips.len() == 2 {
+    for tip in &tips {
+      // Find a Tributary where this isn't the tip
+      for (_, tributary) in &tributaries {
+        let Some(after) = tributary.reader().block_after(tip) else { continue };
+        // Make sure the block after is the other tip
+        assert!(tips.contains(&after));
+        return;
+      }
+    }
+  } else {
+    assert_eq!(tips.len(), 1);
+    return;
+  }
+  panic!("tributary had different tip with a variance exceeding one block");
 }

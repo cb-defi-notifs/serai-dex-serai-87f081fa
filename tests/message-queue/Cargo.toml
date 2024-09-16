@@ -13,6 +13,9 @@ publish = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 hex = "0.4"
 
@@ -25,5 +28,5 @@ serai-primitives = { path = "../../substrate/primitives" }
 serai-message-queue = { path = "../../message-queue" }
 
 tokio = { version = "1", features = ["time"] }
-dockertest = "0.3"
+dockertest = "0.5"
 serai-docker-tests = { path = "../docker" }

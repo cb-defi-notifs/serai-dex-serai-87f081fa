@@ -13,15 +13,16 @@ publish = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
-zeroize = { version = "1", features = ["derive"] }
+scale = { package = "parity-scale-codec", version = "3", default-features = false, features = ["std"] }
+borsh = { version = "1", default-features = false, features = ["std", "derive", "de_strict_order"] }
 
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
+dkg = { path = "../../crypto/dkg", default-features = false, features = ["std", "borsh"] }
 
-dkg = { path = "../../crypto/dkg", features = ["serde"] }
-
-serai-primitives = { path = "../../substrate/primitives" }
-in-instructions-primitives = { package = "serai-in-instructions-primitives", path = "../../substrate/in-instructions/primitives" }
-tokens-primitives = { package = "serai-tokens-primitives", path = "../../substrate/tokens/primitives" }
-validator-sets-primitives = { package = "serai-validator-sets-primitives", path = "../../substrate/validator-sets/primitives" }
+serai-primitives = { path = "../../substrate/primitives", default-features = false, features = ["std", "borsh"] }
+in-instructions-primitives = { package = "serai-in-instructions-primitives", path = "../../substrate/in-instructions/primitives", default-features = false, features = ["std", "borsh"] }
+coins-primitives = { package = "serai-coins-primitives", path = "../../substrate/coins/primitives", default-features = false, features = ["std", "borsh"] }
+validator-sets-primitives = { package = "serai-validator-sets-primitives", path = "../../substrate/validator-sets/primitives", default-features = false, features = ["std", "borsh"] }

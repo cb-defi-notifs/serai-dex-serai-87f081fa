@@ -1,154 +1,197 @@
-use std::io::Read;
+use std::collections::HashMap;
+
+use scale::Encode;
+use borsh::{BorshSerialize, BorshDeserialize};
 
 use ciphersuite::{group::GroupEncoding, Ciphersuite, Ristretto};
+use frost::Participant;
+
+use serai_client::validator_sets::primitives::{KeyPair, ValidatorSet};
+
+use processor_messages::coordinator::SubstrateSignableId;
 
 pub use serai_db::*;
 
-#[derive(Debug)]
-pub struct TributaryDb<D: Db>(pub D);
-impl<D: Db> TributaryDb<D> {
-  pub fn new(db: D) -> Self {
-    Self(db)
+use tributary::ReadWrite;
+
+use crate::tributary::{Label, Transaction};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Encode, BorshSerialize, BorshDeserialize)]
+pub enum Topic {
+  Dkg,
+  DkgConfirmation,
+  SubstrateSign(SubstrateSignableId),
+  Sign([u8; 32]),
+}
+
+// A struct to refer to a piece of data all validators will presumably provide a value for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Encode)]
+pub struct DataSpecification {
+  pub topic: Topic,
+  pub label: Label,
+  pub attempt: u32,
+}
+
+pub enum DataSet {
+  Participating(HashMap<Participant, Vec<u8>>),
+  NotParticipating,
+}
+
+pub enum Accumulation {
+  Ready(DataSet),
+  NotReady,
+}
+
+// TODO: Move from genesis to set for indexing
+create_db!(
+  Tributary {
+    SeraiBlockNumber: (hash: [u8; 32]) -> u64,
+    SeraiDkgCompleted: (spec: ValidatorSet) -> [u8; 32],
+
+    TributaryBlockNumber: (block: [u8; 32]) -> u32,
+    LastHandledBlock: (genesis: [u8; 32]) -> [u8; 32],
+
+    // TODO: Revisit the point of this
+    FatalSlashes: (genesis: [u8; 32]) -> Vec<[u8; 32]>,
+    RemovedAsOfDkgAttempt: (genesis: [u8; 32], attempt: u32) -> Vec<[u8; 32]>,
+    OfflineDuringDkg: (genesis: [u8; 32]) -> Vec<[u8; 32]>,
+    // TODO: Combine these two
+    FatallySlashed: (genesis: [u8; 32], account: [u8; 32]) -> (),
+    SlashPoints: (genesis: [u8; 32], account: [u8; 32]) -> u32,
+
+    VotedToRemove: (genesis: [u8; 32], voter: [u8; 32], to_remove: [u8; 32]) -> (),
+    VotesToRemove: (genesis: [u8; 32], to_remove: [u8; 32]) -> u16,
+
+    AttemptDb: (genesis: [u8; 32], topic: &Topic) -> u32,
+    ReattemptDb: (genesis: [u8; 32], block: u32) -> Vec<Topic>,
+    DataReceived: (genesis: [u8; 32], data_spec: &DataSpecification) -> u16,
+    DataDb: (genesis: [u8; 32], data_spec: &DataSpecification, signer_bytes: &[u8; 32]) -> Vec<u8>,
+
+    DkgShare: (genesis: [u8; 32], from: u16, to: u16) -> Vec<u8>,
+    ConfirmationNonces: (genesis: [u8; 32], attempt: u32) -> HashMap<Participant, Vec<u8>>,
+    DkgKeyPair: (genesis: [u8; 32], attempt: u32) -> KeyPair,
+    KeyToDkgAttempt: (key: [u8; 32]) -> u32,
+    DkgLocallyCompleted: (genesis: [u8; 32]) -> (),
+
+    PlanIds: (genesis: &[u8], block: u64) -> Vec<[u8; 32]>,
+
+    SignedTransactionDb: (order: &[u8], nonce: u32) -> Vec<u8>,
+
+    SlashReports: (genesis: [u8; 32], signer: [u8; 32]) -> Vec<u32>,
+    SlashReported: (genesis: [u8; 32]) -> u16,
+    SlashReportCutOff: (genesis: [u8; 32]) -> u64,
+    SlashReport: (set: ValidatorSet) -> Vec<([u8; 32], u32)>,
+  }
+);
+
+impl FatalSlashes {
+  pub fn get_as_keys(getter: &impl Get, genesis: [u8; 32]) -> Vec<<Ristretto as Ciphersuite>::G> {
+    FatalSlashes::get(getter, genesis)
+      .unwrap_or(vec![])
+      .iter()
+      .map(|key| <Ristretto as Ciphersuite>::G::from_bytes(key).unwrap())
+      .collect::<Vec<_>>()
+  }
+}
+
+impl FatallySlashed {
+  pub fn set_fatally_slashed(txn: &mut impl DbTxn, genesis: [u8; 32], account: [u8; 32]) {
+    Self::set(txn, genesis, account, &());
+    let mut existing = FatalSlashes::get(txn, genesis).unwrap_or_default();
+
+    // Don't append if we already have it, which can occur upon multiple faults
+    if existing.iter().any(|existing| existing == &account) {
+      return;
+    }
+
+    existing.push(account);
+    FatalSlashes::set(txn, genesis, &existing);
+  }
+}
+
+impl AttemptDb {
+  pub fn recognize_topic(txn: &mut impl DbTxn, genesis: [u8; 32], topic: Topic) {
+    Self::set(txn, genesis, &topic, &0u32);
   }
 
-  fn tributary_key(dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-    D::key(b"TRIBUTARY", dst, key)
+  pub fn start_next_attempt(txn: &mut impl DbTxn, genesis: [u8; 32], topic: Topic) -> u32 {
+    let next =
+      Self::attempt(txn, genesis, topic).expect("starting next attempt for unknown topic") + 1;
+    Self::set(txn, genesis, &topic, &next);
+    next
   }
 
-  fn block_key(genesis: [u8; 32]) -> Vec<u8> {
-    Self::tributary_key(b"block", genesis)
+  pub fn attempt(getter: &impl Get, genesis: [u8; 32], topic: Topic) -> Option<u32> {
+    let attempt = Self::get(getter, genesis, &topic);
+    // Don't require explicit recognition of the Dkg topic as it starts when the chain does
+    // Don't require explicit recognition of the SlashReport topic as it isn't a DoS risk and it
+    // should always happen (eventually)
+    if attempt.is_none() &&
+      ((topic == Topic::Dkg) ||
+        (topic == Topic::DkgConfirmation) ||
+        (topic == Topic::SubstrateSign(SubstrateSignableId::SlashReport)))
+    {
+      return Some(0);
+    }
+    attempt
   }
-  pub fn set_last_block(&mut self, genesis: [u8; 32], block: [u8; 32]) {
-    let mut txn = self.0.txn();
-    txn.put(Self::block_key(genesis), block);
-    txn.commit();
-  }
-  pub fn last_block(&self, genesis: [u8; 32]) -> [u8; 32] {
-    self.0.get(Self::block_key(genesis)).map(|last| last.try_into().unwrap()).unwrap_or(genesis)
-  }
+}
 
-  fn plan_ids_key(genesis: &[u8], block: u64) -> Vec<u8> {
-    Self::tributary_key(b"plan_ids", [genesis, block.to_le_bytes().as_ref()].concat())
-  }
-  pub fn set_plan_ids(
-    txn: &mut D::Transaction<'_>,
+impl ReattemptDb {
+  pub fn schedule_reattempt(
+    txn: &mut impl DbTxn,
     genesis: [u8; 32],
-    block: u64,
-    plans: &[[u8; 32]],
+    current_block_number: u32,
+    topic: Topic,
   ) {
-    txn.put(Self::plan_ids_key(&genesis, block), plans.concat());
-  }
-  pub fn plan_ids<G: Get>(getter: &G, genesis: [u8; 32], block: u64) -> Option<Vec<[u8; 32]>> {
-    getter.get(Self::plan_ids_key(&genesis, block)).map(|bytes| {
-      let mut res = vec![];
-      let mut bytes_ref: &[u8] = bytes.as_ref();
-      while !bytes_ref.is_empty() {
-        let mut id = [0; 32];
-        bytes_ref.read_exact(&mut id).unwrap();
-        res.push(id);
-      }
-      res
-    })
+    // 5 minutes
+    #[cfg(not(feature = "longer-reattempts"))]
+    const BASE_REATTEMPT_DELAY: u32 = (5 * 60 * 1000) / tributary::tendermint::TARGET_BLOCK_TIME;
+
+    // 10 minutes, intended for latent environments like the GitHub CI
+    #[cfg(feature = "longer-reattempts")]
+    const BASE_REATTEMPT_DELAY: u32 = (10 * 60 * 1000) / tributary::tendermint::TARGET_BLOCK_TIME;
+
+    // 5 minutes for attempts 0 ..= 2, 10 minutes for attempts 3 ..= 5, 15 minutes for attempts > 5
+    // Assumes no event will take longer than 15 minutes, yet grows the time in case there are
+    // network bandwidth issues
+    let mut reattempt_delay = BASE_REATTEMPT_DELAY *
+      ((AttemptDb::attempt(txn, genesis, topic)
+        .expect("scheduling re-attempt for unknown topic") /
+        3) +
+        1)
+      .min(3);
+    // Allow more time for DKGs since they have an extra round and much more data
+    if matches!(topic, Topic::Dkg) {
+      reattempt_delay *= 4;
+    }
+    let upon_block = current_block_number + reattempt_delay;
+
+    let mut reattempts = Self::get(txn, genesis, upon_block).unwrap_or(vec![]);
+    reattempts.push(topic);
+    Self::set(txn, genesis, upon_block, &reattempts);
   }
 
-  fn recognized_id_key(label: &'static str, genesis: [u8; 32], id: [u8; 32]) -> Vec<u8> {
-    Self::tributary_key(b"recognized", [label.as_bytes(), genesis.as_ref(), id.as_ref()].concat())
+  pub fn take(txn: &mut impl DbTxn, genesis: [u8; 32], block_number: u32) -> Vec<Topic> {
+    let res = Self::get(txn, genesis, block_number).unwrap_or(vec![]);
+    if !res.is_empty() {
+      Self::del(txn, genesis, block_number);
+    }
+    res
   }
-  pub fn recognized_id<G: Get>(
-    getter: &G,
-    label: &'static str,
-    genesis: [u8; 32],
-    id: [u8; 32],
-  ) -> bool {
-    getter.get(Self::recognized_id_key(label, genesis, id)).is_some()
-  }
-  pub fn recognize_id(
-    txn: &mut D::Transaction<'_>,
-    label: &'static str,
-    genesis: [u8; 32],
-    id: [u8; 32],
-  ) {
-    txn.put(Self::recognized_id_key(label, genesis, id), [])
-  }
+}
 
-  fn attempt_key(genesis: [u8; 32], id: [u8; 32]) -> Vec<u8> {
-    let genesis_ref: &[u8] = genesis.as_ref();
-    Self::tributary_key(b"attempt", [genesis_ref, id.as_ref()].concat())
-  }
-  pub fn attempt<G: Get>(getter: &G, genesis: [u8; 32], id: [u8; 32]) -> u32 {
-    u32::from_le_bytes(
-      getter.get(Self::attempt_key(genesis, id)).unwrap_or(vec![0; 4]).try_into().unwrap(),
-    )
-  }
-
-  fn data_received_key(
-    label: &'static [u8],
-    genesis: [u8; 32],
-    id: [u8; 32],
-    attempt: u32,
-  ) -> Vec<u8> {
-    Self::tributary_key(
-      b"data_received",
-      [label, genesis.as_ref(), id.as_ref(), attempt.to_le_bytes().as_ref()].concat(),
-    )
-  }
-  fn data_key(
-    label: &'static [u8],
-    genesis: [u8; 32],
-    id: [u8; 32],
-    attempt: u32,
-    signer: <Ristretto as Ciphersuite>::G,
-  ) -> Vec<u8> {
-    Self::tributary_key(
-      b"data",
-      [
-        label,
-        genesis.as_ref(),
-        id.as_ref(),
-        attempt.to_le_bytes().as_ref(),
-        signer.to_bytes().as_ref(),
-      ]
-      .concat(),
-    )
-  }
-  pub fn data<G: Get>(
-    label: &'static [u8],
-    getter: &G,
-    genesis: [u8; 32],
-    id: [u8; 32],
-    attempt: u32,
-    signer: <Ristretto as Ciphersuite>::G,
-  ) -> Option<Vec<u8>> {
-    getter.get(Self::data_key(label, genesis, id, attempt, signer))
-  }
-  pub fn set_data(
-    label: &'static [u8],
-    txn: &mut D::Transaction<'_>,
-    genesis: [u8; 32],
-    id: [u8; 32],
-    attempt: u32,
-    signer: <Ristretto as Ciphersuite>::G,
-    data: &[u8],
-  ) -> u16 {
-    let received_key = Self::data_received_key(label, genesis, id, attempt);
-    let mut received =
-      u16::from_le_bytes(txn.get(&received_key).unwrap_or(vec![0; 2]).try_into().unwrap());
-    received += 1;
-
-    txn.put(received_key, received.to_le_bytes());
-    txn.put(Self::data_key(label, genesis, id, attempt, signer), data);
-
-    received
-  }
-
-  fn event_key(id: &[u8], index: u32) -> Vec<u8> {
-    Self::tributary_key(b"event", [id, index.to_le_bytes().as_ref()].concat())
-  }
-  pub fn handled_event<G: Get>(getter: &G, id: [u8; 32], index: u32) -> bool {
-    getter.get(Self::event_key(&id, index)).is_some()
-  }
-  pub fn handle_event(txn: &mut D::Transaction<'_>, id: [u8; 32], index: u32) {
-    assert!(!Self::handled_event(txn, id, index));
-    txn.put(Self::event_key(&id, index), []);
+impl SignedTransactionDb {
+  pub fn take_signed_transaction(
+    txn: &mut impl DbTxn,
+    order: &[u8],
+    nonce: u32,
+  ) -> Option<Transaction> {
+    let res = SignedTransactionDb::get(txn, order, nonce)
+      .map(|bytes| Transaction::read(&mut bytes.as_slice()).unwrap());
+    if res.is_some() {
+      Self::del(txn, order, nonce);
+    }
+    res
   }
 }

@@ -39,6 +39,13 @@ pub trait Algorithm<C: Curve>: Send + Sync + Clone {
 
   /// Obtain the list of nonces to generate, as specified by the generators to create commitments
   /// against per-nonce.
+  ///
+  /// The Algorithm is responsible for all transcripting of these nonce specifications/generators.
+  ///
+  /// The prover will be passed the commitments, and the commitments will be sent to all other
+  /// participants. No guarantees the commitments are internally consistent (have the same discrete
+  /// logarithm across generators) are made. Any Algorithm which specifies multiple generators for
+  /// a single nonce must handle that itself.
   fn nonces(&self) -> Vec<Vec<C::G>>;
 
   /// Generate an addendum to FROST"s preprocessing stage.
@@ -51,7 +58,7 @@ pub trait Algorithm<C: Curve>: Send + Sync + Clone {
   /// Read an addendum from a reader.
   fn read_addendum<R: Read>(&self, reader: &mut R) -> io::Result<Self::Addendum>;
 
-  /// Proccess the addendum for the specified participant. Guaranteed to be called in order.
+  /// Process the addendum for the specified participant. Guaranteed to be called in order.
   fn process_addendum(
     &mut self,
     params: &ThresholdView<C>,
@@ -184,7 +191,7 @@ impl<C: Curve, T: Sync + Clone + Debug + Transcript, H: Hram<C>> Algorithm<C> fo
     &mut self,
     _: &ThresholdView<C>,
     _: Participant,
-    _: (),
+    (): (),
   ) -> Result<(), FrostError> {
     Ok(())
   }

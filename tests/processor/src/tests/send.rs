@@ -8,16 +8,21 @@ use dkg::{Participant, tests::clone_without};
 use messages::{sign::SignId, SubstrateContext};
 
 use serai_client::{
-  primitives::{BlockHash, NetworkId},
-  tokens::primitives::{OutInstruction, OutInstructionWithBalance},
+  primitives::{BlockHash, NetworkId, Amount, Balance, SeraiAddress},
+  coins::primitives::{OutInstruction, OutInstructionWithBalance},
+  in_instructions::primitives::{InInstruction, InInstructionWithBalance, Batch},
+  validator_sets::primitives::Session,
 };
+
+use serai_db::MemDb;
+use processor::networks::{Network, Bitcoin, Ethereum, Monero};
 
 use crate::{*, tests::*};
 
 #[allow(unused)]
 pub(crate) async fn recv_sign_preprocesses(
   coordinators: &mut [Coordinator],
-  key: Vec<u8>,
+  session: Session,
   attempt: u32,
 ) -> (SignId, HashMap<Participant, Vec<u8>>) {
   let mut id = None;
@@ -29,16 +34,17 @@ pub(crate) async fn recv_sign_preprocesses(
     match msg {
       messages::ProcessorMessage::Sign(messages::sign::ProcessorMessage::Preprocess {
         id: this_id,
-        preprocess,
+        preprocesses: mut these_preprocesses,
       }) => {
         if id.is_none() {
-          assert_eq!(&this_id.key, &key);
+          assert_eq!(&this_id.session, &session);
           assert_eq!(this_id.attempt, attempt);
           id = Some(this_id.clone());
         }
         assert_eq!(&this_id, id.as_ref().unwrap());
 
-        preprocesses.insert(i, preprocess);
+        assert_eq!(these_preprocesses.len(), 1);
+        preprocesses.insert(i, these_preprocesses.swap_remove(0));
       }
       _ => panic!("processor didn't send sign preprocess"),
     }
@@ -60,6 +66,7 @@ pub(crate) async fn recv_sign_preprocesses(
 #[allow(unused)]
 pub(crate) async fn sign_tx(
   coordinators: &mut [Coordinator],
+  session: Session,
   id: SignId,
   preprocesses: HashMap<Participant, Vec<u8>>,
 ) -> Vec<u8> {
@@ -86,10 +93,11 @@ pub(crate) async fn sign_tx(
       match coordinator.recv_message().await {
         messages::ProcessorMessage::Sign(messages::sign::ProcessorMessage::Share {
           id: this_id,
-          share,
+          shares: mut these_shares,
         }) => {
           assert_eq!(&this_id, &id);
-          shares.insert(i, share);
+          assert_eq!(these_shares.len(), 1);
+          shares.insert(i, these_shares.swap_remove(0));
         }
         _ => panic!("processor didn't send TX shares"),
       }
@@ -117,11 +125,11 @@ pub(crate) async fn sign_tx(
     if preprocesses.contains_key(&i) {
       match coordinator.recv_message().await {
         messages::ProcessorMessage::Sign(messages::sign::ProcessorMessage::Completed {
-          key,
+          session: this_session,
           id: this_id,
           tx: this_tx,
         }) => {
-          assert_eq!(&key, &id.key);
+          assert_eq!(session, this_session);
           assert_eq!(&this_id, &id.id);
 
           if tx.is_none() {
@@ -139,7 +147,7 @@ pub(crate) async fn sign_tx(
 
 #[test]
 fn send_test() {
-  for network in [NetworkId::Bitcoin, NetworkId::Monero] {
+  for network in [NetworkId::Bitcoin, NetworkId::Ethereum, NetworkId::Monero] {
     let (coordinators, test) = new_test(network);
 
     test.run(|ops| async move {
@@ -155,21 +163,26 @@ fn send_test() {
       coordinators[0].sync(&ops, &coordinators[1 ..]).await;
 
       // Generate keys
-      let key_pair = key_gen(&mut coordinators, network).await;
+      let key_pair = key_gen(&mut coordinators).await;
 
       // Now we we have to mine blocks to activate the key
-      // (the first key is activated when the network's block time exceeds the Serai time it was
-      // confirmed at)
-
-      for _ in 0 .. confirmations(network) {
+      // (the first key is activated when the network's time as of a block exceeds the Serai time
+      // it was confirmed at)
+      // Mine multiple sets of medians to ensure the median is sufficiently advanced
+      for _ in 0 .. (10 * confirmations(network)) {
         coordinators[0].add_block(&ops).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
       }
       coordinators[0].sync(&ops, &coordinators[1 ..]).await;
 
       // Send into the processor's wallet
-      let (tx, balance_sent) = wallet.send_to_address(&ops, &key_pair.1, None).await;
+      let mut serai_address = [0; 32];
+      OsRng.fill_bytes(&mut serai_address);
+      let instruction = InInstruction::Transfer(SeraiAddress(serai_address));
+      let (tx, balance_sent) =
+        wallet.send_to_address(&ops, &key_pair.1, Some(instruction.clone())).await;
       for coordinator in &mut coordinators {
-        coordinator.publish_transacton(&ops, &tx).await;
+        coordinator.publish_transaction(&ops, &tx).await;
       }
 
       // Put the TX past the confirmation depth
@@ -186,17 +199,35 @@ fn send_test() {
       // The scanner works on a 5s interval, so this leaves a few s for any processing/latency
       tokio::time::sleep(Duration::from_secs(10)).await;
 
+      let amount_minted = Amount(
+        balance_sent.amount.0 -
+          (2 * match network {
+            NetworkId::Bitcoin => Bitcoin::COST_TO_AGGREGATE,
+            NetworkId::Ethereum => Ethereum::<MemDb>::COST_TO_AGGREGATE,
+            NetworkId::Monero => Monero::COST_TO_AGGREGATE,
+            NetworkId::Serai => panic!("minted for Serai?"),
+          }),
+      );
+
+      let expected_batch = Batch {
+        network,
+        id: 0,
+        block: BlockHash(block_with_tx.unwrap()),
+        instructions: vec![InInstructionWithBalance {
+          instruction,
+          balance: Balance { coin: balance_sent.coin, amount: amount_minted },
+        }],
+      };
+
       // Make sure the proceessors picked it up by checking they're trying to sign a batch for it
-      let (id, preprocesses) = recv_batch_preprocesses(&mut coordinators, key_pair.0 .0, 0).await;
+      let (id, preprocesses) =
+        recv_batch_preprocesses(&mut coordinators, Session(0), &expected_batch, 0).await;
 
       // Continue with signing the batch
-      let batch = sign_batch(&mut coordinators, id, preprocesses).await;
+      let batch = sign_batch(&mut coordinators, key_pair.0 .0, id, preprocesses).await;
 
       // Check it
-      assert_eq!(batch.batch.network, network);
-      assert_eq!(batch.batch.id, 0);
-      assert_eq!(batch.batch.block, BlockHash(block_with_tx.unwrap()));
-      assert!(batch.batch.instructions.is_empty());
+      assert_eq!(batch.batch, expected_batch);
 
       // Fire a SubstrateBlock with a burn
       let substrate_block_num = (OsRng.next_u64() % 4_000_000_000u64) + 1;
@@ -211,14 +242,12 @@ fn send_test() {
               serai_time,
               network_latest_finalized_block: batch.batch.block,
             },
-            network,
             block: substrate_block_num,
-            // TODO: Should we use the network key here? Or should we only use the Ristretto key?
-            key: key_pair.1.to_vec(),
             burns: vec![OutInstructionWithBalance {
               instruction: OutInstruction { address: wallet.address(), data: None },
-              balance: balance_sent,
+              balance: Balance { coin: balance_sent.coin, amount: amount_minted },
             }],
+            batches: vec![batch.batch.id],
           },
         )
         .await;
@@ -233,46 +262,44 @@ fn send_test() {
 
       // Start signing the TX
       let (mut id, mut preprocesses) =
-        recv_sign_preprocesses(&mut coordinators, key_pair.1.to_vec(), 0).await;
-      // TODO: Should this use the Substrate key?
-      assert_eq!(id, SignId { key: key_pair.1.to_vec(), id: plans[0], attempt: 0 });
+        recv_sign_preprocesses(&mut coordinators, Session(0), 0).await;
+      assert_eq!(id, SignId { session: Session(0), id: plans[0].id, attempt: 0 });
 
       // Trigger a random amount of re-attempts
       for attempt in 1 ..= u32::try_from(OsRng.next_u64() % 4).unwrap() {
         // TODO: Double check how the processor handles this ID field
         // It should be able to assert its perfectly sequential
         id.attempt = attempt;
-        for coordinator in coordinators.iter_mut() {
+        for coordinator in &mut coordinators {
           coordinator
             .send_message(messages::sign::CoordinatorMessage::Reattempt { id: id.clone() })
             .await;
         }
-        (id, preprocesses) =
-          recv_sign_preprocesses(&mut coordinators, key_pair.1.to_vec(), attempt).await;
+        (id, preprocesses) = recv_sign_preprocesses(&mut coordinators, Session(0), attempt).await;
       }
-      let participating = preprocesses.keys().cloned().collect::<Vec<_>>();
+      let participating = preprocesses.keys().copied().collect::<Vec<_>>();
 
-      let tx_id = sign_tx(&mut coordinators, id.clone(), preprocesses).await;
+      let tx_id = sign_tx(&mut coordinators, Session(0), id.clone(), preprocesses).await;
 
       // Make sure all participating nodes published the TX
       let participating =
         participating.iter().map(|p| usize::from(u16::from(*p) - 1)).collect::<HashSet<_>>();
       for participant in &participating {
-        assert!(coordinators[*participant].get_transaction(&ops, &tx_id).await.is_some());
+        assert!(coordinators[*participant].get_published_transaction(&ops, &tx_id).await.is_some());
       }
 
       // Publish this transaction to the left out nodes
       let tx = coordinators[*participating.iter().next().unwrap()]
-        .get_transaction(&ops, &tx_id)
+        .get_published_transaction(&ops, &tx_id)
         .await
         .unwrap();
       for (i, coordinator) in coordinators.iter_mut().enumerate() {
         if !participating.contains(&i) {
-          coordinator.publish_transacton(&ops, &tx).await;
-          // Tell them of it as a completion of the relevant signing nodess
+          coordinator.publish_eventuality_completion(&ops, &tx).await;
+          // Tell them of it as a completion of the relevant signing nodes
           coordinator
             .send_message(messages::sign::CoordinatorMessage::Completed {
-              key: key_pair.1.to_vec(),
+              session: Session(0),
               id: id.id,
               tx: tx_id.clone(),
             })
@@ -280,11 +307,11 @@ fn send_test() {
           // Verify they send Completed back
           match coordinator.recv_message().await {
             messages::ProcessorMessage::Sign(messages::sign::ProcessorMessage::Completed {
-              key,
+              session,
               id: this_id,
               tx: this_tx,
             }) => {
-              assert_eq!(&key, &id.key);
+              assert_eq!(session, Session(0));
               assert_eq!(&this_id, &id.id);
               assert_eq!(this_tx, tx_id);
             }
@@ -294,8 +321,8 @@ fn send_test() {
       }
 
       // TODO: Test the Eventuality from the blockchain, instead of from the coordinator
-      // TODO: Test what happenns when Completed is sent with a non-existent TX ID
-      // TODO: Test what happenns when Completed is sent with a non-completing TX ID
+      // TODO: Test what happens when Completed is sent with a non-existent TX ID
+      // TODO: Test what happens when Completed is sent with a non-completing TX ID
     });
   }
 }

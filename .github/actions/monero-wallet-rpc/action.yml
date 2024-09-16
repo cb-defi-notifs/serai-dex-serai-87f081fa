@@ -5,14 +5,14 @@ inputs:
   version:
     description: "Version to download and run"
     required: false
-    default: v0.18.2.0
+    default: v0.18.3.4
 
 runs:
   using: "composite"
   steps:
     - name: Monero Wallet RPC Cache
       id: cache-monero-wallet-rpc
-      uses: actions/cache@v3
+      uses: actions/cache@13aacd865c20de90d75de3b17ebe84f7a17d57d2
       with:
         path: monero-wallet-rpc
         key: monero-wallet-rpc-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
@@ -41,4 +41,9 @@ runs:
 
     - name: Monero Wallet RPC
       shell: bash
-      run: ./monero-wallet-rpc --disable-rpc-login --rpc-bind-port 6061 --allow-mismatched-daemon-version --wallet-dir ./ --detach
+      run: |
+        ./monero-wallet-rpc --allow-mismatched-daemon-version \
+          --daemon-address 0.0.0.0:18081 --daemon-login serai:seraidex \
+          --disable-rpc-login --rpc-bind-port 18082 \
+          --wallet-dir ./ \
+          --detach

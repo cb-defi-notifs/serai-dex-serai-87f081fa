@@ -4,10 +4,10 @@ pub fn reproducibly_builds() {
 
   use rand_core::{RngCore, OsRng};
 
-  use dockertest::{PullPolicy, Image, Composition, DockerTest};
+  use dockertest::{PullPolicy, Image, TestBodySpecification, DockerTest};
 
   const RUNS: usize = 3;
-  const TIMEOUT: u16 = 60 * 60; // 60 minutes
+  const TIMEOUT: u16 = 180 * 60; // 3 hours
 
   serai_docker_tests::build("runtime".to_string());
 
@@ -16,14 +16,14 @@ pub fn reproducibly_builds() {
     OsRng.fill_bytes(id);
   }
 
-  let mut test = DockerTest::new();
+  let mut test = DockerTest::new().with_network(dockertest::Network::Isolated);
   for id in &ids {
-    test.add_composition(
-      Composition::with_image(
+    test.provide_container(
+      TestBodySpecification::with_image(
         Image::with_repository("serai-dev-runtime").pull_policy(PullPolicy::Never),
       )
-      .with_container_name(format!("runtime-build-{}", hex::encode(id)))
-      .with_cmd(vec![
+      .set_handle(format!("runtime-build-{}", hex::encode(id)))
+      .replace_cmd(vec![
         "sh".to_string(),
         "-c".to_string(),
         // Sleep for a minute after building to prevent the container from closing before we
@@ -96,6 +96,6 @@ pub fn reproducibly_builds() {
     for res in res.clone() {
       identical.insert(res.unwrap());
     }
-    assert_eq!(identical.len(), 1, "got different runtime hashes {:?}", res);
+    assert_eq!(identical.len(), 1, "got different runtime hashes {res:?}");
   });
 }

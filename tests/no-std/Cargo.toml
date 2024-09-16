@@ -13,11 +13,14 @@ publish = false
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[dependencies]
-flexible-transcript = { path = "../../crypto/transcript", features = ["recommended", "merlin"] }
+[lints]
+workspace = true
 
-dalek-ff-group = { path = "../../crypto/dalek-ff-group" }
-minimal-ed448 = { path = "../../crypto/ed448" }
+[dependencies]
+flexible-transcript = { path = "../../crypto/transcript", default-features = false, features = ["recommended", "merlin"] }
+
+dalek-ff-group = { path = "../../crypto/dalek-ff-group", default-features = false }
+minimal-ed448 = { path = "../../crypto/ed448", default-features = false }
 
 ciphersuite = { path = "../../crypto/ciphersuite", default-features = false, features = ["alloc", "secp256k1", "p256", "ed25519", "ristretto", "ed448"] }
 
@@ -30,5 +33,6 @@ dkg = { path = "../../crypto/dkg", default-features = false }
 # modular-frost = { path = "../../crypto/frost", default-features = false }
 # frost-schnorrkel = { path = "../../crypto/schnorrkel", default-features = false }
 
-monero-generators = { path = "../../coins/monero/generators", default-features = false }
-monero-serai = { path = "../../coins/monero", default-features = false }
+bitcoin-serai = { path = "../../networks/bitcoin", default-features = false, features = ["hazmat"] }
+
+monero-wallet-util = { path = "../../networks/monero/wallet/util", default-features = false, features = ["compile-time-generators"] }

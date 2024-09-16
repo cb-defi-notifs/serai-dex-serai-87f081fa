@@ -14,7 +14,7 @@ use ciphersuite::group::{ff::PrimeField, GroupEncoding};
 use crate::{
   curve::Curve,
   Participant, ThresholdCore, ThresholdKeys,
-  algorithm::{IetfTranscript, Hram, IetfSchnorr},
+  algorithm::{Hram, IetfSchnorr},
   sign::{
     Writable, Nonce, GeneratorCommitments, NonceCommitments, Commitments, Preprocess,
     PreprocessMachine, SignMachine, SignatureMachine, AlgorithmMachine,
@@ -43,7 +43,7 @@ pub struct Vectors {
 }
 
 // Vectors are expected to be formatted per the IETF proof of concept
-// The included vectors are direcly from
+// The included vectors are directly from
 // https://github.com/cfrg/draft-irtf-cfrg-frost/tree/draft-irtf-cfrg-frost-14/poc
 #[cfg(test)]
 impl From<serde_json::Value> for Vectors {
@@ -143,12 +143,12 @@ fn vectors_to_multisig_keys<C: Curve>(vectors: &Vectors) -> HashMap<Participant,
 /// Test a Ciphersuite with its vectors.
 pub fn test_with_vectors<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(
   rng: &mut R,
-  vectors: Vectors,
+  vectors: &Vectors,
 ) {
   test_ciphersuite::<R, C, H>(rng);
 
   // Test against the vectors
-  let keys = vectors_to_multisig_keys::<C>(&vectors);
+  let keys = vectors_to_multisig_keys::<C>(vectors);
   {
     let group_key =
       <C as Curve>::read_G::<&[u8]>(&mut hex::decode(&vectors.group_key).unwrap().as_ref())
@@ -191,7 +191,6 @@ pub fn test_with_vectors<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(
             nonces: vec![NonceCommitments {
               generators: vec![GeneratorCommitments(these_commitments)],
             }],
-            dleq: None,
           },
           addendum: (),
         };
@@ -301,12 +300,8 @@ pub fn test_with_vectors<R: RngCore + CryptoRng, C: Curve, H: Hram<C>>(
     }
 
     // Also test it at the Commitments level
-    let (generated_nonces, commitments) = Commitments::<C>::new::<_, IetfTranscript>(
-      &mut TransparentRng(randomness),
-      &share,
-      &[vec![C::generator()]],
-      &[],
-    );
+    let (generated_nonces, commitments) =
+      Commitments::<C>::new::<_>(&mut TransparentRng(randomness), &share, &[vec![C::generator()]]);
 
     assert_eq!(generated_nonces.len(), 1);
     assert_eq!(generated_nonces[0].0, [nonces[0].clone(), nonces[1].clone()]);

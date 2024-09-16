@@ -1,112 +1,176 @@
 use core::{marker::PhantomData, fmt};
-use std::collections::{VecDeque, HashMap};
+use std::collections::HashMap;
 
 use rand_core::OsRng;
-
-use ciphersuite::group::GroupEncoding;
 use frost::{
-  ThresholdKeys,
+  ThresholdKeys, FrostError,
   sign::{Writable, PreprocessMachine, SignMachine, SignatureMachine},
 };
 
 use log::{info, debug, warn, error};
 
+use serai_client::validator_sets::primitives::Session;
 use messages::sign::*;
+
+pub use serai_db::*;
+
 use crate::{
   Get, DbTxn, Db,
-  networks::{Transaction, Eventuality, Network},
+  networks::{Eventuality, Network},
 };
 
-#[derive(Debug)]
-pub enum SignerEvent<N: Network> {
-  SignedTransaction { id: [u8; 32], tx: <N::Transaction as Transaction<N>>::Id },
-  ProcessorMessage(ProcessorMessage),
+create_db!(
+  SignerDb {
+    CompletionsDb: (id: [u8; 32]) -> Vec<u8>,
+    EventualityDb: (id: [u8; 32]) -> Vec<u8>,
+    AttemptDb: (id: &SignId) -> (),
+    CompletionDb: (claim: &[u8]) -> Vec<u8>,
+    ActiveSignsDb: () -> Vec<[u8; 32]>,
+    CompletedOnChainDb: (id: &[u8; 32]) -> (),
+  }
+);
+
+impl ActiveSignsDb {
+  fn add_active_sign(txn: &mut impl DbTxn, id: &[u8; 32]) {
+    if CompletedOnChainDb::get(txn, id).is_some() {
+      return;
+    }
+    let mut active = ActiveSignsDb::get(txn).unwrap_or_default();
+    active.push(*id);
+    ActiveSignsDb::set(txn, &active);
+  }
 }
 
-#[derive(Debug)]
-struct SignerDb<N: Network, D: Db>(D, PhantomData<N>);
-impl<N: Network, D: Db> SignerDb<N, D> {
-  fn sign_key(dst: &'static [u8], key: impl AsRef<[u8]>) -> Vec<u8> {
-    D::key(b"SIGNER", dst, key)
+impl CompletedOnChainDb {
+  fn complete_on_chain(txn: &mut impl DbTxn, id: &[u8; 32]) {
+    CompletedOnChainDb::set(txn, id, &());
+    ActiveSignsDb::set(
+      txn,
+      &ActiveSignsDb::get(txn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|active| active != id)
+        .collect::<Vec<_>>(),
+    );
   }
-
-  fn completed_key(id: [u8; 32]) -> Vec<u8> {
-    Self::sign_key(b"completed", id)
-  }
-  fn complete(
-    txn: &mut D::Transaction<'_>,
+}
+impl CompletionsDb {
+  fn completions<N: Network>(
+    getter: &impl Get,
     id: [u8; 32],
-    tx: &<N::Transaction as Transaction<N>>::Id,
-  ) {
-    // Transactions can be completed by multiple signatures
-    // Save every solution in order to be robust
-    let mut existing = txn.get(Self::completed_key(id)).unwrap_or(vec![]);
+  ) -> Vec<<N::Eventuality as Eventuality>::Claim> {
+    let Some(completions) = Self::get(getter, id) else { return vec![] };
 
-    // Don't add this TX if it's already present
-    let tx_len = tx.as_ref().len();
-    assert_eq!(existing.len() % tx_len, 0);
-
-    let mut i = 0;
-    while i < existing.len() {
-      if &existing[i .. (i + tx_len)] == tx.as_ref() {
-        return;
-      }
-      i += tx_len;
+    // If this was set yet is empty, it's because it's the encoding of a claim with a length of 0
+    if completions.is_empty() {
+      let default = <N::Eventuality as Eventuality>::Claim::default();
+      assert_eq!(default.as_ref().len(), 0);
+      return vec![default];
     }
 
-    existing.extend(tx.as_ref());
-    txn.put(Self::completed_key(id), existing);
-  }
-  fn completed<G: Get>(getter: &G, id: [u8; 32]) -> Option<Vec<u8>> {
-    getter.get(Self::completed_key(id))
-  }
-
-  fn eventuality_key(id: [u8; 32]) -> Vec<u8> {
-    Self::sign_key(b"eventuality", id)
-  }
-  fn save_eventuality(txn: &mut D::Transaction<'_>, id: [u8; 32], eventuality: N::Eventuality) {
-    txn.put(Self::eventuality_key(id), eventuality.serialize());
-  }
-  fn eventuality<G: Get>(getter: &G, id: [u8; 32]) -> Option<N::Eventuality> {
-    Some(
-      N::Eventuality::read::<&[u8]>(&mut getter.get(Self::eventuality_key(id))?.as_ref()).unwrap(),
-    )
+    let mut completions_ref = completions.as_slice();
+    let mut res = vec![];
+    while !completions_ref.is_empty() {
+      let mut id = <N::Eventuality as Eventuality>::Claim::default();
+      let id_len = id.as_ref().len();
+      id.as_mut().copy_from_slice(&completions_ref[.. id_len]);
+      completions_ref = &completions_ref[id_len ..];
+      res.push(id);
+    }
+    res
   }
 
-  fn attempt_key(id: &SignId) -> Vec<u8> {
-    Self::sign_key(b"attempt", bincode::serialize(id).unwrap())
-  }
-  fn attempt(txn: &mut D::Transaction<'_>, id: &SignId) {
-    txn.put(Self::attempt_key(id), []);
-  }
-  fn has_attempt<G: Get>(getter: &G, id: &SignId) -> bool {
-    getter.get(Self::attempt_key(id)).is_some()
-  }
+  fn complete<N: Network>(
+    txn: &mut impl DbTxn,
+    id: [u8; 32],
+    completion: &<N::Eventuality as Eventuality>::Completion,
+  ) {
+    // Completions can be completed by multiple signatures
+    // Save every solution in order to be robust
+    CompletionDb::save_completion::<N>(txn, completion);
 
-  fn save_transaction(txn: &mut D::Transaction<'_>, tx: &N::Transaction) {
-    txn.put(Self::sign_key(b"tx", tx.id()), tx.serialize());
+    let claim = N::Eventuality::claim(completion);
+    let claim: &[u8] = claim.as_ref();
+
+    // If claim has a 0-byte encoding, the set key, even if empty, is the claim
+    if claim.is_empty() {
+      Self::set(txn, id, &vec![]);
+      return;
+    }
+
+    let mut existing = Self::get(txn, id).unwrap_or_default();
+    assert_eq!(existing.len() % claim.len(), 0);
+
+    // Don't add this completion if it's already present
+    let mut i = 0;
+    while i < existing.len() {
+      if &existing[i .. (i + claim.len())] == claim {
+        return;
+      }
+      i += claim.len();
+    }
+
+    existing.extend(claim);
+    Self::set(txn, id, &existing);
   }
 }
+
+impl EventualityDb {
+  fn save_eventuality<N: Network>(
+    txn: &mut impl DbTxn,
+    id: [u8; 32],
+    eventuality: &N::Eventuality,
+  ) {
+    txn.put(Self::key(id), eventuality.serialize());
+  }
+
+  fn eventuality<N: Network>(getter: &impl Get, id: [u8; 32]) -> Option<N::Eventuality> {
+    Some(N::Eventuality::read(&mut getter.get(Self::key(id))?.as_slice()).unwrap())
+  }
+}
+
+impl CompletionDb {
+  fn save_completion<N: Network>(
+    txn: &mut impl DbTxn,
+    completion: &<N::Eventuality as Eventuality>::Completion,
+  ) {
+    let claim = N::Eventuality::claim(completion);
+    let claim: &[u8] = claim.as_ref();
+    Self::set(txn, claim, &N::Eventuality::serialize_completion(completion));
+  }
+
+  fn completion<N: Network>(
+    getter: &impl Get,
+    claim: &<N::Eventuality as Eventuality>::Claim,
+  ) -> Option<<N::Eventuality as Eventuality>::Completion> {
+    Self::get(getter, claim.as_ref())
+      .map(|completion| N::Eventuality::read_completion::<&[u8]>(&mut completion.as_ref()).unwrap())
+  }
+}
+
+type PreprocessFor<N> = <<N as Network>::TransactionMachine as PreprocessMachine>::Preprocess;
+type SignMachineFor<N> = <<N as Network>::TransactionMachine as PreprocessMachine>::SignMachine;
+type SignatureShareFor<N> = <SignMachineFor<N> as SignMachine<
+  <<N as Network>::Eventuality as Eventuality>::Completion,
+>>::SignatureShare;
+type SignatureMachineFor<N> = <SignMachineFor<N> as SignMachine<
+  <<N as Network>::Eventuality as Eventuality>::Completion,
+>>::SignatureMachine;
 
 pub struct Signer<N: Network, D: Db> {
   db: PhantomData<D>,
 
   network: N,
 
-  keys: ThresholdKeys<N::Curve>,
+  session: Session,
+  keys: Vec<ThresholdKeys<N::Curve>>,
 
   signable: HashMap<[u8; 32], N::SignableTransaction>,
   attempt: HashMap<[u8; 32], u32>,
-  preprocessing: HashMap<[u8; 32], <N::TransactionMachine as PreprocessMachine>::SignMachine>,
   #[allow(clippy::type_complexity)]
-  signing: HashMap<
-    [u8; 32],
-    <
-      <N::TransactionMachine as PreprocessMachine>::SignMachine as SignMachine<N::Transaction>
-    >::SignatureMachine,
-  >,
-
-  pub events: VecDeque<SignerEvent<N>>,
+  preprocessing: HashMap<[u8; 32], (Vec<SignMachineFor<N>>, Vec<PreprocessFor<N>>)>,
+  #[allow(clippy::type_complexity)]
+  signing: HashMap<[u8; 32], (SignatureMachineFor<N>, Vec<SignatureShareFor<N>>)>,
 }
 
 impl<N: Network, D: Db> fmt::Debug for Signer<N, D> {
@@ -121,25 +185,39 @@ impl<N: Network, D: Db> fmt::Debug for Signer<N, D> {
 }
 
 impl<N: Network, D: Db> Signer<N, D> {
-  pub fn new(network: N, keys: ThresholdKeys<N::Curve>) -> Signer<N, D> {
+  /// Rebroadcast already signed TXs which haven't had their completions mined into a sufficiently
+  /// confirmed block.
+  pub async fn rebroadcast_task(db: D, network: N) {
+    log::info!("rebroadcasting transactions for plans whose completions yet to be confirmed...");
+    loop {
+      for active in ActiveSignsDb::get(&db).unwrap_or_default() {
+        for claim in CompletionsDb::completions::<N>(&db, active) {
+          log::info!("rebroadcasting completion with claim {}", hex::encode(claim.as_ref()));
+          // TODO: Don't drop the error entirely. Check for invariants
+          let _ =
+            network.publish_completion(&CompletionDb::completion::<N>(&db, &claim).unwrap()).await;
+        }
+      }
+      // Only run every five minutes so we aren't frequently loading tens to hundreds of KB from
+      // the DB
+      tokio::time::sleep(core::time::Duration::from_secs(5 * 60)).await;
+    }
+  }
+  pub fn new(network: N, session: Session, keys: Vec<ThresholdKeys<N::Curve>>) -> Signer<N, D> {
+    assert!(!keys.is_empty());
     Signer {
       db: PhantomData,
 
       network,
 
+      session,
       keys,
 
       signable: HashMap::new(),
       attempt: HashMap::new(),
       preprocessing: HashMap::new(),
       signing: HashMap::new(),
-
-      events: VecDeque::new(),
     }
-  }
-
-  pub fn keys(&self) -> ThresholdKeys<N::Curve> {
-    self.keys.clone()
   }
 
   fn verify_id(&self, id: &SignId) -> Result<(), ()> {
@@ -172,8 +250,9 @@ impl<N: Network, D: Db> Signer<N, D> {
     Ok(())
   }
 
-  fn already_completed(&self, txn: &mut D::Transaction<'_>, id: [u8; 32]) -> bool {
-    if SignerDb::<N, D>::completed(txn, id).is_some() {
+  #[must_use]
+  fn already_completed(txn: &mut D::Transaction<'_>, id: [u8; 32]) -> bool {
+    if !CompletionsDb::completions::<N>(txn, id).is_empty() {
       debug!(
         "SignTransaction/Reattempt order for {}, which we've already completed signing",
         hex::encode(id)
@@ -185,7 +264,12 @@ impl<N: Network, D: Db> Signer<N, D> {
     }
   }
 
-  fn complete(&mut self, id: [u8; 32], tx_id: <N::Transaction as Transaction<N>>::Id) {
+  #[must_use]
+  fn complete(
+    &mut self,
+    id: [u8; 32],
+    claim: &<N::Eventuality as Eventuality>::Claim,
+  ) -> ProcessorMessage {
     // Assert we're actively signing for this TX
     assert!(self.signable.remove(&id).is_some(), "completed a TX we weren't signing for");
     assert!(self.attempt.remove(&id).is_some(), "attempt had an ID signable didn't have");
@@ -198,60 +282,94 @@ impl<N: Network, D: Db> Signer<N, D> {
     self.signing.remove(&id);
 
     // Emit the event for it
-    self.events.push_back(SignerEvent::SignedTransaction { id, tx: tx_id });
+    ProcessorMessage::Completed { session: self.session, id, tx: claim.as_ref().to_vec() }
   }
 
-  pub async fn eventuality_completion(
+  #[must_use]
+  pub fn completed(
     &mut self,
     txn: &mut D::Transaction<'_>,
     id: [u8; 32],
-    tx_id: &<N::Transaction as Transaction<N>>::Id,
-  ) {
-    if let Some(eventuality) = SignerDb::<N, D>::eventuality(txn, id) {
-      // Transaction hasn't hit our mempool/was dropped for a different signature
-      // The latter can happen given certain latency conditions/a single malicious signer
-      // In the case of a single malicious signer, they can drag multiple honest
-      // validators down with them, so we unfortunately can't slash on this case
-      let Ok(tx) = self.network.get_transaction(tx_id).await else {
-        warn!(
-          "a validator claimed {} completed {} yet we didn't have that TX in our mempool",
-          hex::encode(tx_id),
-          hex::encode(id),
-        );
-        return;
-      };
+    completion: &<N::Eventuality as Eventuality>::Completion,
+  ) -> Option<ProcessorMessage> {
+    let first_completion = !Self::already_completed(txn, id);
 
-      if self.network.confirm_completion(&eventuality, &tx) {
-        info!("eventuality for {} resolved in TX {}", hex::encode(id), hex::encode(tx_id));
+    // Save this completion to the DB
+    CompletedOnChainDb::complete_on_chain(txn, &id);
+    CompletionsDb::complete::<N>(txn, id, completion);
 
-        let first_completion = !self.already_completed(txn, id);
-
-        // Save this completion to the DB
-        SignerDb::<N, D>::save_transaction(txn, &tx);
-        SignerDb::<N, D>::complete(txn, id, tx_id);
-
-        if first_completion {
-          self.complete(id, tx.id());
-        }
-      } else {
-        warn!(
-          "a validator claimed {} completed {} when it did not",
-          hex::encode(tx_id),
-          hex::encode(id)
-        );
-      }
+    if first_completion {
+      Some(self.complete(id, &N::Eventuality::claim(completion)))
     } else {
-      warn!(
-        "signer {} informed of the completion of plan {}. that plan was not recognized",
-        hex::encode(self.keys.group_key().to_bytes()),
-        hex::encode(id),
-      );
+      None
     }
   }
 
-  async fn attempt(&mut self, txn: &mut D::Transaction<'_>, id: [u8; 32], attempt: u32) {
-    if self.already_completed(txn, id) {
-      return;
+  /// Returns Some if the first completion.
+  // Doesn't use any loops/retries since we'll eventually get this from the Scanner anyways
+  #[must_use]
+  async fn claimed_eventuality_completion(
+    &mut self,
+    txn: &mut D::Transaction<'_>,
+    id: [u8; 32],
+    claim: &<N::Eventuality as Eventuality>::Claim,
+  ) -> Option<ProcessorMessage> {
+    if let Some(eventuality) = EventualityDb::eventuality::<N>(txn, id) {
+      match self.network.confirm_completion(&eventuality, claim).await {
+        Ok(Some(completion)) => {
+          info!(
+            "signer eventuality for {} resolved in {}",
+            hex::encode(id),
+            hex::encode(claim.as_ref())
+          );
+
+          let first_completion = !Self::already_completed(txn, id);
+
+          // Save this completion to the DB
+          CompletionsDb::complete::<N>(txn, id, &completion);
+
+          if first_completion {
+            return Some(self.complete(id, claim));
+          }
+        }
+        Ok(None) => {
+          warn!(
+            "a validator claimed {} completed {} when it did not",
+            hex::encode(claim.as_ref()),
+            hex::encode(id),
+          );
+        }
+        Err(_) => {
+          // Transaction hasn't hit our mempool/was dropped for a different signature
+          // The latter can happen given certain latency conditions/a single malicious signer
+          // In the case of a single malicious signer, they can drag multiple honest validators down
+          // with them, so we unfortunately can't slash on this case
+          warn!(
+            "a validator claimed {} completed {} yet we couldn't check that claim",
+            hex::encode(claim.as_ref()),
+            hex::encode(id),
+          );
+        }
+      }
+    } else {
+      warn!(
+        "informed of completion {} for eventuality {}, when we didn't have that eventuality",
+        hex::encode(claim.as_ref()),
+        hex::encode(id),
+      );
+    }
+    None
+  }
+
+  #[must_use]
+  async fn attempt(
+    &mut self,
+    txn: &mut D::Transaction<'_>,
+    id: [u8; 32],
+    attempt: u32,
+  ) -> Option<ProcessorMessage> {
+    if Self::already_completed(txn, id) {
+      return None;
     }
 
     // Check if we're already working on this attempt
@@ -263,7 +381,7 @@ impl<N: Network, D: Db> Signer<N, D> {
           attempt,
           curr_attempt
         );
-        return;
+        return None;
       }
     }
 
@@ -272,7 +390,7 @@ impl<N: Network, D: Db> Signer<N, D> {
     // (also because we do need an owned tx anyways)
     let Some(tx) = self.signable.get(&id).cloned() else {
       warn!("told to attempt a TX we aren't currently signing for");
-      return;
+      return None;
     };
 
     // Delete any existing machines
@@ -282,7 +400,7 @@ impl<N: Network, D: Db> Signer<N, D> {
     // Update the attempt number
     self.attempt.insert(id, attempt);
 
-    let id = SignId { key: self.keys.group_key().to_bytes().as_ref().to_vec(), id, attempt };
+    let id = SignId { session: self.session, id, attempt };
 
     info!("signing for {} #{}", hex::encode(id.id), id.attempt);
 
@@ -298,114 +416,151 @@ impl<N: Network, D: Db> Signer<N, D> {
     // branch again for something we've already attempted
     //
     // Only run if this hasn't already been attempted
-    if SignerDb::<N, D>::has_attempt(txn, &id) {
+    // TODO: This isn't complete as this txn may not be committed with the expected timing
+    if AttemptDb::get(txn, &id).is_some() {
       warn!(
         "already attempted {} #{}. this is an error if we didn't reboot",
         hex::encode(id.id),
         id.attempt
       );
-      return;
+      return None;
     }
-
-    SignerDb::<N, D>::attempt(txn, &id);
+    AttemptDb::set(txn, &id, &());
 
     // Attempt to create the TX
-    let machine = match self.network.attempt_send(tx).await {
-      Err(e) => {
-        error!("failed to attempt {}, #{}: {:?}", hex::encode(id.id), id.attempt, e);
-        return;
-      }
-      Ok(machine) => machine,
-    };
+    let mut machines = vec![];
+    let mut preprocesses = vec![];
+    let mut serialized_preprocesses = vec![];
+    for keys in &self.keys {
+      let machine = match self.network.attempt_sign(keys.clone(), tx.clone()).await {
+        Err(e) => {
+          error!("failed to attempt {}, #{}: {:?}", hex::encode(id.id), id.attempt, e);
+          return None;
+        }
+        Ok(machine) => machine,
+      };
 
-    // TODO: Use a seeded RNG here so we don't produce distinct messages with the same intent
-    // This is also needed so we don't preprocess, send preprocess, reboot before ack'ing the
-    // message, send distinct preprocess, and then attempt a signing session premised on the former
-    // with the latter
-    let (machine, preprocess) = machine.preprocess(&mut OsRng);
-    self.preprocessing.insert(id.id, machine);
+      let (machine, preprocess) = machine.preprocess(&mut OsRng);
+      machines.push(machine);
+      serialized_preprocesses.push(preprocess.serialize());
+      preprocesses.push(preprocess);
+    }
+
+    self.preprocessing.insert(id.id, (machines, preprocesses));
 
     // Broadcast our preprocess
-    self.events.push_back(SignerEvent::ProcessorMessage(ProcessorMessage::Preprocess {
-      id,
-      preprocess: preprocess.serialize(),
-    }));
+    Some(ProcessorMessage::Preprocess { id, preprocesses: serialized_preprocesses })
   }
 
+  #[must_use]
   pub async fn sign_transaction(
     &mut self,
     txn: &mut D::Transaction<'_>,
     id: [u8; 32],
     tx: N::SignableTransaction,
-    eventuality: N::Eventuality,
-  ) {
-    if self.already_completed(txn, id) {
-      return;
+    eventuality: &N::Eventuality,
+  ) -> Option<ProcessorMessage> {
+    // The caller is expected to re-issue sign orders on reboot
+    // This is solely used by the rebroadcast task
+    ActiveSignsDb::add_active_sign(txn, &id);
+
+    if Self::already_completed(txn, id) {
+      return None;
     }
 
-    SignerDb::<N, D>::save_eventuality(txn, id, eventuality);
+    EventualityDb::save_eventuality::<N>(txn, id, eventuality);
 
     self.signable.insert(id, tx);
-    self.attempt(txn, id, 0).await;
+    self.attempt(txn, id, 0).await
   }
 
-  pub async fn handle(&mut self, txn: &mut D::Transaction<'_>, msg: CoordinatorMessage) {
+  #[must_use]
+  pub async fn handle(
+    &mut self,
+    txn: &mut D::Transaction<'_>,
+    msg: CoordinatorMessage,
+  ) -> Option<ProcessorMessage> {
     match msg {
-      CoordinatorMessage::Preprocesses { id, mut preprocesses } => {
+      CoordinatorMessage::Preprocesses { id, preprocesses } => {
         if self.verify_id(&id).is_err() {
-          return;
+          return None;
         }
 
-        let machine = match self.preprocessing.remove(&id.id) {
+        let (machines, our_preprocesses) = match self.preprocessing.remove(&id.id) {
           // Either rebooted or RPC error, or some invariant
           None => {
             warn!(
               "not preprocessing for {}. this is an error if we didn't reboot",
               hex::encode(id.id)
             );
-            return;
+            return None;
           }
           Some(machine) => machine,
         };
 
-        let preprocesses = match preprocesses
-          .drain()
-          .map(|(l, preprocess)| {
-            let mut preprocess_ref = preprocess.as_ref();
-            let res = machine
-              .read_preprocess::<&[u8]>(&mut preprocess_ref)
-              .map(|preprocess| (l, preprocess));
-            if !preprocess_ref.is_empty() {
-              todo!("malicious signer: extra bytes");
+        let mut parsed = HashMap::new();
+        for l in {
+          let mut keys = preprocesses.keys().copied().collect::<Vec<_>>();
+          keys.sort();
+          keys
+        } {
+          let mut preprocess_ref = preprocesses.get(&l).unwrap().as_slice();
+          let Ok(res) = machines[0].read_preprocess(&mut preprocess_ref) else {
+            return Some(ProcessorMessage::InvalidParticipant { id, participant: l });
+          };
+          if !preprocess_ref.is_empty() {
+            return Some(ProcessorMessage::InvalidParticipant { id, participant: l });
+          }
+          parsed.insert(l, res);
+        }
+        let preprocesses = parsed;
+
+        // Only keep a single machine as we only need one to get the signature
+        let mut signature_machine = None;
+        let mut shares = vec![];
+        let mut serialized_shares = vec![];
+        for (m, machine) in machines.into_iter().enumerate() {
+          let mut preprocesses = preprocesses.clone();
+          for (i, our_preprocess) in our_preprocesses.clone().into_iter().enumerate() {
+            if i != m {
+              assert!(preprocesses.insert(self.keys[i].params().i(), our_preprocess).is_none());
             }
-            res
-          })
-          .collect::<Result<_, _>>()
-        {
-          Ok(preprocesses) => preprocesses,
-          Err(e) => todo!("malicious signer: {:?}", e),
-        };
+          }
 
-        // Use an empty message, as expected of TransactionMachines
-        let (machine, share) = match machine.sign(preprocesses, &[]) {
-          Ok(res) => res,
-          Err(e) => todo!("malicious signer: {:?}", e),
-        };
-        self.signing.insert(id.id, machine);
+          // Use an empty message, as expected of TransactionMachines
+          let (machine, share) = match machine.sign(preprocesses, &[]) {
+            Ok(res) => res,
+            Err(e) => match e {
+              FrostError::InternalError(_) |
+              FrostError::InvalidParticipant(_, _) |
+              FrostError::InvalidSigningSet(_) |
+              FrostError::InvalidParticipantQuantity(_, _) |
+              FrostError::DuplicatedParticipant(_) |
+              FrostError::MissingParticipant(_) => unreachable!(),
 
-        // Broadcast our share
-        self.events.push_back(SignerEvent::ProcessorMessage(ProcessorMessage::Share {
-          id,
-          share: share.serialize(),
-        }));
+              FrostError::InvalidPreprocess(l) | FrostError::InvalidShare(l) => {
+                return Some(ProcessorMessage::InvalidParticipant { id, participant: l })
+              }
+            },
+          };
+          if m == 0 {
+            signature_machine = Some(machine);
+          }
+          serialized_shares.push(share.serialize());
+          shares.push(share);
+        }
+        self.signing.insert(id.id, (signature_machine.unwrap(), shares));
+
+        // Broadcast our shares
+        Some(ProcessorMessage::Share { id, shares: serialized_shares })
       }
 
-      CoordinatorMessage::Shares { id, mut shares } => {
+      CoordinatorMessage::Shares { id, shares } => {
         if self.verify_id(&id).is_err() {
-          return;
+          return None;
         }
 
-        let machine = match self.signing.remove(&id.id) {
+        let (machine, our_shares) = match self.signing.remove(&id.id) {
           // Rebooted, RPC error, or some invariant
           None => {
             // If preprocessing has this ID, it means we were never sent the preprocess by the
@@ -418,69 +573,81 @@ impl<N: Network, D: Db> Signer<N, D> {
               "not preprocessing for {}. this is an error if we didn't reboot",
               hex::encode(id.id)
             );
-            return;
+            return None;
           }
           Some(machine) => machine,
         };
 
-        let shares = match shares
-          .drain()
-          .map(|(l, share)| {
-            let mut share_ref = share.as_ref();
-            let res = machine.read_share::<&[u8]>(&mut share_ref).map(|share| (l, share));
-            if !share_ref.is_empty() {
-              todo!("malicious signer: extra bytes");
-            }
-            res
-          })
-          .collect::<Result<_, _>>()
-        {
-          Ok(shares) => shares,
-          Err(e) => todo!("malicious signer: {:?}", e),
-        };
+        let mut parsed = HashMap::new();
+        for l in {
+          let mut keys = shares.keys().copied().collect::<Vec<_>>();
+          keys.sort();
+          keys
+        } {
+          let mut share_ref = shares.get(&l).unwrap().as_slice();
+          let Ok(res) = machine.read_share(&mut share_ref) else {
+            return Some(ProcessorMessage::InvalidParticipant { id, participant: l });
+          };
+          if !share_ref.is_empty() {
+            return Some(ProcessorMessage::InvalidParticipant { id, participant: l });
+          }
+          parsed.insert(l, res);
+        }
+        let mut shares = parsed;
 
-        let tx = match machine.complete(shares) {
+        for (i, our_share) in our_shares.into_iter().enumerate().skip(1) {
+          assert!(shares.insert(self.keys[i].params().i(), our_share).is_none());
+        }
+
+        let completion = match machine.complete(shares) {
           Ok(res) => res,
-          Err(e) => todo!("malicious signer: {:?}", e),
+          Err(e) => match e {
+            FrostError::InternalError(_) |
+            FrostError::InvalidParticipant(_, _) |
+            FrostError::InvalidSigningSet(_) |
+            FrostError::InvalidParticipantQuantity(_, _) |
+            FrostError::DuplicatedParticipant(_) |
+            FrostError::MissingParticipant(_) => unreachable!(),
+
+            FrostError::InvalidPreprocess(l) | FrostError::InvalidShare(l) => {
+              return Some(ProcessorMessage::InvalidParticipant { id, participant: l })
+            }
+          },
         };
 
-        // Save the transaction in case it's needed for recovery
-        SignerDb::<N, D>::save_transaction(txn, &tx);
-        let tx_id = tx.id();
-        SignerDb::<N, D>::complete(txn, id.id, &tx_id);
+        // Save the completion in case it's needed for recovery
+        CompletionsDb::complete::<N>(txn, id.id, &completion);
 
         // Publish it
-        if let Err(e) = self.network.publish_transaction(&tx).await {
-          error!("couldn't publish {:?}: {:?}", tx, e);
+        if let Err(e) = self.network.publish_completion(&completion).await {
+          error!("couldn't publish completion for plan {}: {:?}", hex::encode(id.id), e);
         } else {
-          info!("published {} for plan {}", hex::encode(&tx_id), hex::encode(id.id));
+          info!("published completion for plan {}", hex::encode(id.id));
         }
 
         // Stop trying to sign for this TX
-        self.complete(id.id, tx_id);
+        Some(self.complete(id.id, &N::Eventuality::claim(&completion)))
       }
 
-      CoordinatorMessage::Reattempt { id } => {
-        self.attempt(txn, id.id, id.attempt).await;
-      }
+      CoordinatorMessage::Reattempt { id } => self.attempt(txn, id.id, id.attempt).await,
 
-      CoordinatorMessage::Completed { key: _, id, tx: mut tx_vec } => {
-        let mut tx = <N::Transaction as Transaction<N>>::Id::default();
-        if tx.as_ref().len() != tx_vec.len() {
-          let true_len = tx_vec.len();
-          tx_vec.truncate(2 * tx.as_ref().len());
+      CoordinatorMessage::Completed { session: _, id, tx: mut claim_vec } => {
+        let mut claim = <N::Eventuality as Eventuality>::Claim::default();
+        if claim.as_ref().len() != claim_vec.len() {
+          let true_len = claim_vec.len();
+          claim_vec.truncate(2 * claim.as_ref().len());
           warn!(
             "a validator claimed {}... (actual length {}) completed {} yet {}",
-            hex::encode(&tx_vec),
+            hex::encode(&claim_vec),
             true_len,
             hex::encode(id),
-            "that's not a valid TX ID",
+            "that's not a valid Claim",
           );
-          return;
+          return None;
         }
-        tx.as_mut().copy_from_slice(&tx_vec);
+        claim.as_mut().copy_from_slice(&claim_vec);
 
-        self.eventuality_completion(txn, id, &tx).await;
+        self.claimed_eventuality_completion(txn, id, &claim).await
       }
     }
   }

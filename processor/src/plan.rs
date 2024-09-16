@@ -1,16 +1,23 @@
 use std::io;
 
+use scale::{Encode, Decode};
+
 use transcript::{Transcript, RecommendedTranscript};
 use ciphersuite::group::GroupEncoding;
 use frost::curve::Ciphersuite;
 
-use crate::networks::{Output, Network};
+use serai_client::primitives::Balance;
+
+use crate::{
+  networks::{Output, Network},
+  multisigs::scheduler::{SchedulerAddendum, Scheduler},
+};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Payment<N: Network> {
   pub address: N::Address,
   pub data: Option<Vec<u8>>,
-  pub amount: u64,
+  pub balance: Balance,
 }
 
 impl<N: Network> Payment<N> {
@@ -20,15 +27,17 @@ impl<N: Network> Payment<N> {
     if let Some(data) = self.data.as_ref() {
       transcript.append_message(b"data", data);
     }
-    transcript.append_message(b"amount", self.amount.to_le_bytes());
+    transcript.append_message(b"coin", self.balance.coin.encode());
+    transcript.append_message(b"amount", self.balance.amount.0.to_le_bytes());
   }
 
   pub fn write<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+    // TODO: Don't allow creating Payments with an Address which can't be serialized
     let address: Vec<u8> = self
       .address
       .clone()
       .try_into()
-      .map_err(|_| io::Error::new(io::ErrorKind::Other, "address couldn't be serialized"))?;
+      .map_err(|_| io::Error::other("address couldn't be serialized"))?;
     writer.write_all(&u32::try_from(address.len()).unwrap().to_le_bytes())?;
     writer.write_all(&address)?;
 
@@ -38,7 +47,7 @@ impl<N: Network> Payment<N> {
       writer.write_all(data)?;
     }
 
-    writer.write_all(&self.amount.to_le_bytes())
+    writer.write_all(&self.balance.encode())
   }
 
   pub fn read<R: io::Read>(reader: &mut R) -> io::Result<Self> {
@@ -46,8 +55,7 @@ impl<N: Network> Payment<N> {
     reader.read_exact(&mut buf)?;
     let mut address = vec![0; usize::try_from(u32::from_le_bytes(buf)).unwrap()];
     reader.read_exact(&mut address)?;
-    let address = N::Address::try_from(address)
-      .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid address"))?;
+    let address = N::Address::try_from(address).map_err(|_| io::Error::other("invalid address"))?;
 
     let mut buf = [0; 1];
     reader.read_exact(&mut buf)?;
@@ -61,20 +69,35 @@ impl<N: Network> Payment<N> {
       None
     };
 
-    let mut buf = [0; 8];
-    reader.read_exact(&mut buf)?;
-    let amount = u64::from_le_bytes(buf);
+    let balance = Balance::decode(&mut scale::IoReader(reader))
+      .map_err(|_| io::Error::other("invalid balance"))?;
 
-    Ok(Payment { address, data, amount })
+    Ok(Payment { address, data, balance })
   }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct Plan<N: Network> {
   pub key: <N::Curve as Ciphersuite>::G,
   pub inputs: Vec<N::Output>,
+  /// The payments this Plan is intended to create.
+  ///
+  /// This should only contain payments leaving Serai. While it is acceptable for users to enter
+  /// Serai's address(es) as the payment address, as that'll be handled by anything which expects
+  /// certain properties, Serai as a system MUST NOT use payments for internal transfers. Doing
+  /// so will cause a reduction in their value by the TX fee/operating costs, creating an
+  /// incomplete transfer.
   pub payments: Vec<Payment<N>>,
-  pub change: Option<<N::Curve as Ciphersuite>::G>,
+  /// The change this Plan should use.
+  ///
+  /// This MUST contain a Serai address. Operating costs may be deducted from the payments in this
+  /// Plan on the premise that the change address is Serai's, and accordingly, Serai will recoup
+  /// the operating costs.
+  //
+  // TODO: Consider moving to ::G?
+  pub change: Option<N::Address>,
+  /// The scheduler's additional data.
+  pub scheduler_addendum: <N::Scheduler as Scheduler<N>>::Addendum,
 }
 impl<N: Network> core::fmt::Debug for Plan<N> {
   fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
@@ -83,7 +106,8 @@ impl<N: Network> core::fmt::Debug for Plan<N> {
       .field("key", &hex::encode(self.key.to_bytes()))
       .field("inputs", &self.inputs)
       .field("payments", &self.payments)
-      .field("change", &self.change.map(|change| hex::encode(change.to_bytes())))
+      .field("change", &self.change.as_ref().map(ToString::to_string))
+      .field("scheduler_addendum", &self.scheduler_addendum)
       .finish()
   }
 }
@@ -105,9 +129,13 @@ impl<N: Network> Plan<N> {
       payment.transcript(&mut transcript);
     }
 
-    if let Some(change) = self.change {
-      transcript.append_message(b"change", change.to_bytes());
+    if let Some(change) = &self.change {
+      transcript.append_message(b"change", change.to_string());
     }
+
+    let mut addendum_bytes = vec![];
+    self.scheduler_addendum.write(&mut addendum_bytes).unwrap();
+    transcript.append_message(b"scheduler_addendum", addendum_bytes);
 
     transcript
   }
@@ -132,12 +160,21 @@ impl<N: Network> Plan<N> {
       payment.write(writer)?;
     }
 
-    writer.write_all(&[u8::from(self.change.is_some())])?;
-    if let Some(change) = &self.change {
-      writer.write_all(change.to_bytes().as_ref())?;
-    }
-
-    Ok(())
+    // TODO: Have Plan construction fail if change cannot be serialized
+    let change = if let Some(change) = &self.change {
+      change.clone().try_into().map_err(|_| {
+        io::Error::other(format!(
+          "an address we said to use as change couldn't be converted to a Vec<u8>: {}",
+          change.to_string(),
+        ))
+      })?
+    } else {
+      vec![]
+    };
+    assert!(serai_client::primitives::MAX_ADDRESS_LEN <= u8::MAX.into());
+    writer.write_all(&[u8::try_from(change.len()).unwrap()])?;
+    writer.write_all(&change)?;
+    self.scheduler_addendum.write(writer)
   }
 
   pub fn read<R: io::Read>(reader: &mut R) -> io::Result<Self> {
@@ -156,10 +193,20 @@ impl<N: Network> Plan<N> {
       payments.push(Payment::<N>::read(reader)?);
     }
 
-    let mut buf = [0; 1];
-    reader.read_exact(&mut buf)?;
-    let change = if buf[0] == 1 { Some(N::Curve::read_G(reader)?) } else { None };
+    let mut len = [0; 1];
+    reader.read_exact(&mut len)?;
+    let mut change = vec![0; usize::from(len[0])];
+    reader.read_exact(&mut change)?;
+    let change =
+      if change.is_empty() {
+        None
+      } else {
+        Some(N::Address::try_from(change).map_err(|_| {
+          io::Error::other("couldn't deserialize an Address serialized into a Plan")
+        })?)
+      };
 
-    Ok(Plan { key, inputs, payments, change })
+    let scheduler_addendum = <N::Scheduler as Scheduler<N>>::Addendum::read(reader)?;
+    Ok(Plan { key, inputs, payments, change, scheduler_addendum })
   }
 }

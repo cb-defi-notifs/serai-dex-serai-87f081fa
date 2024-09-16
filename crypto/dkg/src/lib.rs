@@ -16,10 +16,10 @@ pub mod musig;
 #[cfg(feature = "std")]
 pub mod encryption;
 
-/// The distributed key generation protocol described in the
-/// [FROST paper](https://eprint.iacr.org/2020/852).
+/// The PedPoP distributed key generation protocol described in the
+/// [FROST paper](https://eprint.iacr.org/2020/852), augmented to be verifiable.
 #[cfg(feature = "std")]
-pub mod frost;
+pub mod pedpop;
 
 /// Promote keys between ciphersuites.
 #[cfg(feature = "std")]
@@ -31,7 +31,7 @@ pub mod tests;
 
 /// The ID of a participant, defined as a non-zero u16.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Zeroize)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "borsh", derive(borsh::BorshSerialize))]
 pub struct Participant(pub(crate) u16);
 impl Participant {
   /// Create a new Participant identifier from a u16.
@@ -94,7 +94,7 @@ pub enum DkgError<B: Clone + PartialEq + Eq + Debug> {
 
   /// An invalid proof of knowledge was provided.
   #[cfg_attr(feature = "std", error("invalid proof of knowledge (participant {0})"))]
-  InvalidProofOfKnowledge(Participant),
+  InvalidCommitments(Participant),
   /// An invalid DKG share was provided.
   #[cfg_attr(feature = "std", error("invalid share (participant {participant}, blame {blame})"))]
   InvalidShare { participant: Participant, blame: Option<B> },
@@ -116,6 +116,14 @@ mod lib {
     },
     Ciphersuite,
   };
+
+  #[cfg(feature = "borsh")]
+  impl borsh::BorshDeserialize for Participant {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+      Participant::new(u16::deserialize_reader(reader)?)
+        .ok_or_else(|| io::Error::other("invalid participant"))
+    }
+  }
 
   // Validate a map of values to have the expected included participants
   pub(crate) fn validate_map<T, B: Clone + PartialEq + Eq + Debug>(
@@ -146,7 +154,7 @@ mod lib {
   /// Parameters for a multisig.
   // These fields should not be made public as they should be static
   #[derive(Clone, Copy, PartialEq, Eq, Debug, Zeroize)]
-  #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+  #[cfg_attr(feature = "borsh", derive(borsh::BorshSerialize))]
   pub struct ThresholdParams {
     /// Participants needed to sign on behalf of the group.
     pub(crate) t: u16,
@@ -184,6 +192,16 @@ mod lib {
     /// Return the participant index of the share with these parameters.
     pub fn i(&self) -> Participant {
       self.i
+    }
+  }
+
+  #[cfg(feature = "borsh")]
+  impl borsh::BorshDeserialize for ThresholdParams {
+    fn deserialize_reader<R: io::Read>(reader: &mut R) -> io::Result<Self> {
+      let t = u16::deserialize_reader(reader)?;
+      let n = u16::deserialize_reader(reader)?;
+      let i = Participant::deserialize_reader(reader)?;
+      ThresholdParams::new(t, n, i).map_err(|e| io::Error::other(format!("{e:?}")))
     }
   }
 
@@ -239,7 +257,7 @@ mod lib {
       self.params.zeroize();
       self.secret_share.zeroize();
       self.group_key.zeroize();
-      for (_, share) in self.verification_shares.iter_mut() {
+      for share in self.verification_shares.values_mut() {
         share.zeroize();
       }
     }
@@ -306,8 +324,7 @@ mod lib {
     /// Read keys from a type satisfying std::io::Read.
     pub fn read<R: io::Read>(reader: &mut R) -> io::Result<ThresholdCore<C>> {
       {
-        let different =
-          || io::Error::new(io::ErrorKind::Other, "deserializing ThresholdCore for another curve");
+        let different = || io::Error::other("deserializing ThresholdCore for another curve");
 
         let mut id_len = [0; 4];
         reader.read_exact(&mut id_len)?;
@@ -331,8 +348,7 @@ mod lib {
         (
           read_u16()?,
           read_u16()?,
-          Participant::new(read_u16()?)
-            .ok_or(io::Error::new(io::ErrorKind::Other, "invalid participant index"))?,
+          Participant::new(read_u16()?).ok_or(io::Error::other("invalid participant index"))?,
         )
       };
 
@@ -344,8 +360,7 @@ mod lib {
       }
 
       Ok(ThresholdCore::new(
-        ThresholdParams::new(t, n, i)
-          .map_err(|_| io::Error::new(io::ErrorKind::Other, "invalid parameters"))?,
+        ThresholdParams::new(t, n, i).map_err(|_| io::Error::other("invalid parameters"))?,
         secret_share,
         verification_shares,
       ))
@@ -395,10 +410,10 @@ mod lib {
       self.group_key.zeroize();
       self.included.zeroize();
       self.secret_share.zeroize();
-      for (_, share) in self.original_verification_shares.iter_mut() {
+      for share in self.original_verification_shares.values_mut() {
         share.zeroize();
       }
-      for (_, share) in self.verification_shares.iter_mut() {
+      for share in self.verification_shares.values_mut() {
         share.zeroize();
       }
     }
@@ -469,7 +484,7 @@ mod lib {
       );
 
       let mut verification_shares = self.verification_shares();
-      for (i, share) in verification_shares.iter_mut() {
+      for (i, share) in &mut verification_shares {
         *share *= lagrange::<C::F>(*i, &included);
       }
 

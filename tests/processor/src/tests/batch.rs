@@ -5,40 +5,63 @@ use std::{
 
 use dkg::{Participant, tests::clone_without};
 
-use messages::{sign::SignId, SubstrateContext};
+use messages::{coordinator::*, SubstrateContext};
 
 use serai_client::{
-  primitives::{BlockHash, crypto::RuntimePublic, PublicKey, SeraiAddress, NetworkId},
-  in_instructions::primitives::{
-    InInstruction, InInstructionWithBalance, SignedBatch, batch_message,
+  primitives::{
+    BlockHash, Amount, Balance, crypto::RuntimePublic, PublicKey, SeraiAddress, NetworkId,
   },
+  in_instructions::primitives::{
+    InInstruction, InInstructionWithBalance, Batch, SignedBatch, batch_message,
+  },
+  validator_sets::primitives::Session,
 };
+
+use serai_db::MemDb;
+use processor::networks::{Network, Bitcoin, Ethereum, Monero};
 
 use crate::{*, tests::*};
 
 pub(crate) async fn recv_batch_preprocesses(
   coordinators: &mut [Coordinator],
-  key: [u8; 32],
+  session: Session,
+  batch: &Batch,
   attempt: u32,
-) -> (SignId, HashMap<Participant, Vec<u8>>) {
-  let mut id = None;
+) -> (SubstrateSignId, HashMap<Participant, [u8; 64]>) {
+  let id = SubstrateSignId { session, id: SubstrateSignableId::Batch(batch.id), attempt };
+
+  let mut block = None;
   let mut preprocesses = HashMap::new();
   for (i, coordinator) in coordinators.iter_mut().enumerate() {
     let i = Participant::new(u16::try_from(i).unwrap() + 1).unwrap();
 
-    let msg = coordinator.recv_message().await;
-    match msg {
-      messages::ProcessorMessage::Coordinator(
-        messages::coordinator::ProcessorMessage::BatchPreprocess { id: this_id, preprocess },
-      ) => {
-        if id.is_none() {
-          assert_eq!(&this_id.key, &key);
-          assert_eq!(this_id.attempt, attempt);
-          id = Some(this_id.clone());
+    if attempt == 0 {
+      match coordinator.recv_message().await {
+        messages::ProcessorMessage::Substrate(messages::substrate::ProcessorMessage::Batch {
+          batch: sent_batch,
+        }) => {
+          assert_eq!(&sent_batch, batch);
         }
-        assert_eq!(&this_id, id.as_ref().unwrap());
+        _ => panic!("processor didn't send batch"),
+      }
+    }
 
-        preprocesses.insert(i, preprocess);
+    match coordinator.recv_message().await {
+      messages::ProcessorMessage::Coordinator(
+        messages::coordinator::ProcessorMessage::BatchPreprocess {
+          id: this_id,
+          block: this_block,
+          preprocesses: mut these_preprocesses,
+        },
+      ) => {
+        assert_eq!(this_id, id);
+        if block.is_none() {
+          block = Some(this_block);
+        }
+        assert_eq!(&this_block, block.as_ref().unwrap());
+
+        assert_eq!(these_preprocesses.len(), 1);
+        preprocesses.insert(i, these_preprocesses.swap_remove(0));
       }
       _ => panic!("processor didn't send batch preprocess"),
     }
@@ -54,13 +77,14 @@ pub(crate) async fn recv_batch_preprocesses(
     );
   }
 
-  (id.unwrap(), preprocesses)
+  (id, preprocesses)
 }
 
 pub(crate) async fn sign_batch(
   coordinators: &mut [Coordinator],
-  id: SignId,
-  preprocesses: HashMap<Participant, Vec<u8>>,
+  key: [u8; 32],
+  id: SubstrateSignId,
+  preprocesses: HashMap<Participant, [u8; 64]>,
 ) -> SignedBatch {
   assert_eq!(preprocesses.len(), THRESHOLD);
 
@@ -69,7 +93,7 @@ pub(crate) async fn sign_batch(
 
     if preprocesses.contains_key(&i) {
       coordinator
-        .send_message(messages::coordinator::CoordinatorMessage::BatchPreprocesses {
+        .send_message(messages::coordinator::CoordinatorMessage::SubstratePreprocesses {
           id: id.clone(),
           preprocesses: clone_without(&preprocesses, &i),
         })
@@ -84,10 +108,14 @@ pub(crate) async fn sign_batch(
     if preprocesses.contains_key(&i) {
       match coordinator.recv_message().await {
         messages::ProcessorMessage::Coordinator(
-          messages::coordinator::ProcessorMessage::BatchShare { id: this_id, share },
+          messages::coordinator::ProcessorMessage::SubstrateShare {
+            id: this_id,
+            shares: mut these_shares,
+          },
         ) => {
           assert_eq!(&this_id, &id);
-          shares.insert(i, share);
+          assert_eq!(these_shares.len(), 1);
+          shares.insert(i, these_shares.swap_remove(0));
         }
         _ => panic!("processor didn't send batch share"),
       }
@@ -99,7 +127,7 @@ pub(crate) async fn sign_batch(
 
     if preprocesses.contains_key(&i) {
       coordinator
-        .send_message(messages::coordinator::CoordinatorMessage::BatchShares {
+        .send_message(messages::coordinator::CoordinatorMessage::SubstrateShares {
           id: id.clone(),
           shares: clone_without(&shares, &i),
         })
@@ -114,14 +142,11 @@ pub(crate) async fn sign_batch(
 
     if preprocesses.contains_key(&i) {
       match coordinator.recv_message().await {
-        messages::ProcessorMessage::Substrate(messages::substrate::ProcessorMessage::Update {
-          key,
-          batch: this_batch,
-        }) => {
-          assert_eq!(&key, &id.key);
-
+        messages::ProcessorMessage::Substrate(
+          messages::substrate::ProcessorMessage::SignedBatch { batch: this_batch },
+        ) => {
           if batch.is_none() {
-            assert!(PublicKey::from_raw(id.key.clone().try_into().unwrap())
+            assert!(PublicKey::from_raw(key)
               .verify(&batch_message(&this_batch.batch), &this_batch.signature));
 
             batch = Some(this_batch.clone());
@@ -139,25 +164,19 @@ pub(crate) async fn sign_batch(
 pub(crate) async fn substrate_block(
   coordinator: &mut Coordinator,
   block: messages::substrate::CoordinatorMessage,
-) -> Vec<[u8; 32]> {
+) -> Vec<PlanMeta> {
   match block.clone() {
     messages::substrate::CoordinatorMessage::SubstrateBlock {
       context: _,
-      network: sent_network,
       block: sent_block,
-      key: _,
       burns: _,
+      batches: _,
     } => {
       coordinator.send_message(block).await;
       match coordinator.recv_message().await {
         messages::ProcessorMessage::Coordinator(
-          messages::coordinator::ProcessorMessage::SubstrateBlockAck {
-            network: recvd_network,
-            block: recvd_block,
-            plans,
-          },
+          messages::coordinator::ProcessorMessage::SubstrateBlockAck { block: recvd_block, plans },
         ) => {
-          assert_eq!(recvd_network, sent_network);
           assert_eq!(recvd_block, sent_block);
           plans
         }
@@ -170,7 +189,7 @@ pub(crate) async fn substrate_block(
 
 #[test]
 fn batch_test() {
-  for network in [NetworkId::Bitcoin, NetworkId::Monero] {
+  for network in [NetworkId::Bitcoin, NetworkId::Ethereum, NetworkId::Monero] {
     let (coordinators, test) = new_test(network);
 
     test.run(|ops| async move {
@@ -186,14 +205,15 @@ fn batch_test() {
       coordinators[0].sync(&ops, &coordinators[1 ..]).await;
 
       // Generate keys
-      let key_pair = key_gen(&mut coordinators, network).await;
+      let key_pair = key_gen(&mut coordinators).await;
 
       // Now we we have to mine blocks to activate the key
-      // (the first key is activated when the coin's block time exceeds the Serai time it was
-      // confirmed at)
-
-      for _ in 0 .. confirmations(network) {
+      // (the first key is activated when the network's time as of a block exceeds the Serai time
+      // it was confirmed at)
+      // Mine multiple sets of medians to ensure the median is sufficiently advanced
+      for _ in 0 .. (10 * confirmations(network)) {
         coordinators[0].add_block(&ops).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
       }
       coordinators[0].sync(&ops, &coordinators[1 ..]).await;
 
@@ -203,13 +223,13 @@ fn batch_test() {
         let mut serai_address = [0; 32];
         OsRng.fill_bytes(&mut serai_address);
         let instruction =
-          if i == 1 { Some(InInstruction::Transfer(SeraiAddress(serai_address))) } else { None };
+          if i == 0 { Some(InInstruction::Transfer(SeraiAddress(serai_address))) } else { None };
 
         // Send into the processor's wallet
         let (tx, balance_sent) =
           wallet.send_to_address(&ops, &key_pair.1, instruction.clone()).await;
         for coordinator in &mut coordinators {
-          coordinator.publish_transacton(&ops, &tx).await;
+          coordinator.publish_transaction(&ops, &tx).await;
         }
 
         // Put the TX past the confirmation depth
@@ -226,15 +246,47 @@ fn batch_test() {
         // The scanner works on a 5s interval, so this leaves a few s for any processing/latency
         tokio::time::sleep(Duration::from_secs(10)).await;
 
-        // Make sure the proceessors picked it up by checking they're trying to sign a batch for it
+        println!("sent in transaction. with in instruction: {}", instruction.is_some());
+
+        let expected_batch = Batch {
+          network,
+          id: i,
+          block: BlockHash(block_with_tx.unwrap()),
+          instructions: if let Some(instruction) = &instruction {
+            vec![InInstructionWithBalance {
+              instruction: instruction.clone(),
+              balance: Balance {
+                coin: balance_sent.coin,
+                amount: Amount(
+                  balance_sent.amount.0 -
+                    (2 * match network {
+                      NetworkId::Bitcoin => Bitcoin::COST_TO_AGGREGATE,
+                      NetworkId::Ethereum => Ethereum::<MemDb>::COST_TO_AGGREGATE,
+                      NetworkId::Monero => Monero::COST_TO_AGGREGATE,
+                      NetworkId::Serai => panic!("minted for Serai?"),
+                    }),
+                ),
+              },
+            }]
+          } else {
+            // This shouldn't have an instruction as we didn't add any data into the TX we sent
+            // Empty batches remain valuable as they let us achieve consensus on the block and spend
+            // contained outputs
+            vec![]
+          },
+        };
+
+        println!("receiving batch preprocesses...");
+
+        // Make sure the processors picked it up by checking they're trying to sign a batch for it
         let (mut id, mut preprocesses) =
-          recv_batch_preprocesses(&mut coordinators, key_pair.0 .0, 0).await;
+          recv_batch_preprocesses(&mut coordinators, Session(0), &expected_batch, 0).await;
         // Trigger a random amount of re-attempts
         for attempt in 1 ..= u32::try_from(OsRng.next_u64() % 4).unwrap() {
           // TODO: Double check how the processor handles this ID field
           // It should be able to assert its perfectly sequential
           id.attempt = attempt;
-          for coordinator in coordinators.iter_mut() {
+          for coordinator in &mut coordinators {
             coordinator
               .send_message(messages::coordinator::CoordinatorMessage::BatchReattempt {
                 id: id.clone(),
@@ -242,48 +294,62 @@ fn batch_test() {
               .await;
           }
           (id, preprocesses) =
-            recv_batch_preprocesses(&mut coordinators, key_pair.0 .0, attempt).await;
+            recv_batch_preprocesses(&mut coordinators, Session(0), &expected_batch, attempt).await;
         }
+
+        println!("signing batch...");
 
         // Continue with signing the batch
-        let batch = sign_batch(&mut coordinators, id, preprocesses).await;
+        let batch = sign_batch(&mut coordinators, key_pair.0 .0, id, preprocesses).await;
 
         // Check it
-        assert_eq!(batch.batch.network, network);
-        assert_eq!(batch.batch.id, i);
-        assert_eq!(batch.batch.block, BlockHash(block_with_tx.unwrap()));
-        if let Some(instruction) = instruction {
-          assert_eq!(
-            batch.batch.instructions,
-            vec![InInstructionWithBalance { instruction, balance: balance_sent }]
-          );
-        } else {
-          // This shouldn't have an instruction as we didn't add any data into the TX we sent
-          // Empty batches remain valuable as they let us achieve consensus on the block and spend
-          // contained outputs
-          assert!(batch.batch.instructions.is_empty());
-        }
+        assert_eq!(batch.batch, expected_batch);
 
         // Fire a SubstrateBlock
         let serai_time =
           SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         for coordinator in &mut coordinators {
-          assert!(substrate_block(
+          let plans = substrate_block(
             coordinator,
             messages::substrate::CoordinatorMessage::SubstrateBlock {
               context: SubstrateContext {
                 serai_time,
                 network_latest_finalized_block: batch.batch.block,
               },
-              network,
               block: substrate_block_num + u64::from(i),
-              // TODO: Should we use the network key here? Or should we only use the Ristretto key?
-              key: key_pair.1.to_vec(),
               burns: vec![],
+              batches: vec![batch.batch.id],
             },
           )
-          .await
-          .is_empty());
+          .await;
+          if instruction.is_some() || (instruction.is_none() && (network == NetworkId::Monero)) {
+            assert!(plans.is_empty());
+          } else {
+            // If no instruction was used, and the processor csn presume the origin, it'd have
+            // created a refund Plan
+            assert_eq!(plans.len(), 1);
+          }
+        }
+      }
+
+      // With the latter InInstruction not existing, we should've triggered a refund if the origin
+      // was detectable
+      // Check this is trying to sign a Plan
+      if network != NetworkId::Monero {
+        let mut refund_id = None;
+        for coordinator in &mut coordinators {
+          match coordinator.recv_message().await {
+            messages::ProcessorMessage::Sign(messages::sign::ProcessorMessage::Preprocess {
+              id,
+              ..
+            }) => {
+              if refund_id.is_none() {
+                refund_id = Some(id.clone());
+              }
+              assert_eq!(refund_id.as_ref().unwrap(), &id);
+            }
+            _ => panic!("processor didn't send preprocess for expected refund transaction"),
+          }
         }
       }
     });

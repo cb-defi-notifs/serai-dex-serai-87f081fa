@@ -7,16 +7,27 @@ repository = "https://github.com/serai-dex/serai/tree/develop/coordinator/tender
 authors = ["Luke Parker <lukeparker5132@gmail.com>"]
 edition = "2021"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
 [dependencies]
-async-trait = "0.1"
-thiserror = "1"
+async-trait = { version = "0.1", default-features = false }
+thiserror = { version = "1", default-features = false }
 
-log = "0.4"
+hex = { version = "0.4", default-features = false, features = ["std"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
 
-parity-scale-codec = { version = "3", features = ["derive"] }
+parity-scale-codec = { version = "3", default-features = false, features = ["std", "derive"] }
 
-futures = "0.3"
-tokio = { version = "1", features = ["sync", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro", "sink", "channel"] }
+futures-channel = { version = "0.3", default-features = false, features = ["std", "sink"] }
+patchable-async-sleep = { version = "0.1", path = "../../../common/patchable-async-sleep", default-features = false }
+
+serai-db = { path = "../../../common/db", version = "0.1", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }

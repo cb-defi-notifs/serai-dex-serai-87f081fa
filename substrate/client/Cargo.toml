@@ -2,37 +2,50 @@
 name = "serai-client"
 version = "0.1.0"
 description = "Client library for the Serai network"
-license = "AGPL-3.0-only"
+license = "MIT"
 repository = "https://github.com/serai-dex/serai/tree/develop/substrate/client"
 authors = ["Luke Parker <lukeparker5132@gmail.com>"]
 keywords = ["serai"]
 edition = "2021"
+rust-version = "1.74"
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lints]
+workspace = true
+
 [dependencies]
 zeroize = "^1.5"
 thiserror = { version = "1", optional = true }
 
+hex = "0.4"
 scale = { package = "parity-scale-codec", version = "3" }
-scale-info = { version = "2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
-serai-runtime = { path = "../runtime", version = "0.1" }
+serai-abi = { path = "../abi", version = "0.1" }
 
-sp-core = { git = "https://github.com/serai-dex/substrate" }
-subxt = { version = "0.29", default-features = false, features = ["jsonrpsee-ws"], optional = true }
+multiaddr = { version = "0.18", optional = true }
+sp-core = { git = "https://github.com/serai-dex/substrate", optional = true }
+sp-runtime = { git = "https://github.com/serai-dex/substrate", optional = true }
+frame-system = { git = "https://github.com/serai-dex/substrate", optional = true }
 
-bitcoin = { version = "0.30", optional = true }
+async-lock = "3"
 
-ciphersuite = { path = "../../crypto/ciphersuite", version = "0.3", optional = true }
-monero-serai = { path = "../../coins/monero", version = "0.1.4-alpha", optional = true }
+simple-request = { path = "../../common/request", version = "0.1", optional = true }
+
+bitcoin = { version = "0.32", optional = true }
+
+ciphersuite = { path = "../../crypto/ciphersuite", version = "0.4", optional = true }
+monero-wallet = { path = "../../networks/monero/wallet", version = "0.1.0", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
-lazy_static = "1"
-
 rand_core = "0.6"
+hex = "0.4"
+
+blake2 = "0.10"
 
 ciphersuite = { path = "../../crypto/ciphersuite", features = ["ristretto"] }
 frost = { package = "modular-frost", path = "../../crypto/frost", features = ["tests"] }
@@ -40,12 +53,16 @@ schnorrkel = { path = "../../crypto/schnorrkel", package = "frost-schnorrkel" }
 
 tokio = "1"
 
+dockertest = "0.5"
+serai-docker-tests = { path = "../../tests/docker" }
+
 [features]
-serai = ["thiserror", "scale-info", "subxt"]
+serai = ["thiserror", "serde", "serde_json", "serai-abi/serde", "multiaddr", "sp-core", "sp-runtime", "frame-system", "simple-request"]
+borsh = ["serai-abi/borsh"]
 
 networks = []
 bitcoin = ["networks", "dep:bitcoin"]
-monero = ["networks", "ciphersuite/ed25519", "monero-serai"]
+monero = ["networks", "ciphersuite/ed25519", "monero-wallet"]
 
 # Assumes the default usage is to use Serai as a DEX, which doesn't actually
 # require connecting to a Serai node

@@ -42,6 +42,7 @@ fn u8_from_bool(bit_ref: &mut bool) -> u8 {
   let bit_ref = black_box(bit_ref);
 
   let mut bit = black_box(*bit_ref);
+  #[allow(clippy::cast_lossless)]
   let res = black_box(bit as u8);
   bit.zeroize();
   debug_assert!((res | 1) == 1);
@@ -55,11 +56,9 @@ pub(crate) fn read_point<R: Read, G: PrimeGroup>(r: &mut R) -> io::Result<G> {
   let mut repr = G::Repr::default();
   r.read_exact(repr.as_mut())?;
   let point = G::from_bytes(&repr);
-  let Some(point) = Option::<G>::from(point) else {
-    Err(io::Error::new(io::ErrorKind::Other, "invalid point"))?
-  };
+  let Some(point) = Option::<G>::from(point) else { Err(io::Error::other("invalid point"))? };
   if point.to_bytes().as_ref() != repr.as_ref() {
-    Err(io::Error::new(io::ErrorKind::Other, "non-canonical point"))?;
+    Err(io::Error::other("non-canonical point"))?;
   }
   Ok(point)
 }
@@ -95,9 +94,6 @@ impl<G: PrimeGroup> Generators<G> {
 /// Error for cross-group DLEq proofs.
 #[derive(Error, PartialEq, Eq, Debug)]
 pub enum DLEqError {
-  /// Invalid proof of knowledge.
-  #[error("invalid proof of knowledge")]
-  InvalidProofOfKnowledge,
   /// Invalid proof length.
   #[error("invalid proof length")]
   InvalidProofLength,
@@ -116,15 +112,12 @@ pub enum DLEqError {
 // anyone who wants it
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct __DLEqProof<
-  G0: PrimeGroup + Zeroize,
-  G1: PrimeGroup + Zeroize,
+  G0: PrimeGroup<Scalar: PrimeFieldBits> + Zeroize,
+  G1: PrimeGroup<Scalar: PrimeFieldBits> + Zeroize,
   const SIGNATURE: u8,
   const RING_LEN: usize,
   const REMAINDER_RING_LEN: usize,
-> where
-  G0::Scalar: PrimeFieldBits,
-  G1::Scalar: PrimeFieldBits,
-{
+> {
   bits: Vec<Bits<G0, G1, SIGNATURE, RING_LEN>>,
   remainder: Option<Bits<G0, G1, SIGNATURE, REMAINDER_RING_LEN>>,
   poks: (SchnorrPoK<G0>, SchnorrPoK<G1>),
@@ -204,15 +197,12 @@ dleq!(
 );
 
 impl<
-    G0: PrimeGroup + Zeroize,
-    G1: PrimeGroup + Zeroize,
+    G0: PrimeGroup<Scalar: PrimeFieldBits + Zeroize> + Zeroize,
+    G1: PrimeGroup<Scalar: PrimeFieldBits + Zeroize> + Zeroize,
     const SIGNATURE: u8,
     const RING_LEN: usize,
     const REMAINDER_RING_LEN: usize,
   > __DLEqProof<G0, G1, SIGNATURE, RING_LEN, REMAINDER_RING_LEN>
-where
-  G0::Scalar: PrimeFieldBits + Zeroize,
-  G1::Scalar: PrimeFieldBits + Zeroize,
 {
   pub(crate) fn transcript<T: Transcript>(
     transcript: &mut T,
@@ -283,7 +273,7 @@ where
     };
 
     let capacity = usize::try_from(G0::Scalar::CAPACITY.min(G1::Scalar::CAPACITY)).unwrap();
-    let bits_per_group = BitSignature::from(SIGNATURE).bits();
+    let bits_per_group = usize::from(BitSignature::from(SIGNATURE).bits());
 
     let mut pow_2 = (generators.0.primary, generators.1.primary);
 
@@ -396,7 +386,7 @@ where
     generators: (Generators<G0>, Generators<G1>),
   ) -> Result<(G0, G1), DLEqError> {
     let capacity = usize::try_from(G0::Scalar::CAPACITY.min(G1::Scalar::CAPACITY)).unwrap();
-    let bits_per_group = BitSignature::from(SIGNATURE).bits();
+    let bits_per_group = usize::from(BitSignature::from(SIGNATURE).bits());
     let has_remainder = (capacity % bits_per_group) != 0;
 
     // These shouldn't be possible, as locally created and deserialized proofs should be properly
@@ -412,10 +402,8 @@ where
     Self::transcript(transcript, generators, keys);
 
     let batch_capacity = match BitSignature::from(SIGNATURE) {
-      BitSignature::ClassicLinear => 3,
-      BitSignature::ConciseLinear => 3,
-      BitSignature::EfficientLinear => (self.bits.len() + 1) * 3,
-      BitSignature::CompromiseLinear => (self.bits.len() + 1) * 3,
+      BitSignature::ClassicLinear | BitSignature::ConciseLinear => 3,
+      BitSignature::EfficientLinear | BitSignature::CompromiseLinear => (self.bits.len() + 1) * 3,
     };
     let mut batch = (BatchVerifier::new(batch_capacity), BatchVerifier::new(batch_capacity));
 
@@ -454,7 +442,7 @@ where
   #[cfg(feature = "serialize")]
   pub fn read<R: Read>(r: &mut R) -> io::Result<Self> {
     let capacity = usize::try_from(G0::Scalar::CAPACITY.min(G1::Scalar::CAPACITY)).unwrap();
-    let bits_per_group = BitSignature::from(SIGNATURE).bits();
+    let bits_per_group = usize::from(BitSignature::from(SIGNATURE).bits());
 
     let mut bits = Vec::with_capacity(capacity / bits_per_group);
     for _ in 0 .. (capacity / bits_per_group) {

@@ -1,39 +1,52 @@
-use serai_runtime::{in_instructions, InInstructions, Runtime};
-pub use in_instructions::primitives;
+pub use serai_abi::in_instructions::primitives;
 use primitives::SignedBatch;
-
-use subxt::utils::Encoded;
 
 use crate::{
   primitives::{BlockHash, NetworkId},
-  SeraiError, Serai, scale_value,
+  Transaction, SeraiError, Serai, TemporalSerai,
 };
 
-pub type InInstructionsEvent = in_instructions::Event<Runtime>;
+pub type InInstructionsEvent = serai_abi::in_instructions::Event;
 
 const PALLET: &str = "InInstructions";
 
-impl Serai {
-  pub async fn get_latest_block_for_network(
+#[derive(Clone, Copy)]
+pub struct SeraiInInstructions<'a>(pub(crate) &'a TemporalSerai<'a>);
+impl<'a> SeraiInInstructions<'a> {
+  pub async fn latest_block_for_network(
     &self,
-    hash: [u8; 32],
     network: NetworkId,
   ) -> Result<Option<BlockHash>, SeraiError> {
-    self.storage(PALLET, "LatestBlock", Some(vec![scale_value(network)]), hash).await
+    self.0.storage(PALLET, "LatestNetworkBlock", network).await
   }
 
-  pub async fn get_batch_events(
+  pub async fn last_batch_for_network(
     &self,
-    block: [u8; 32],
-  ) -> Result<Vec<InInstructionsEvent>, SeraiError> {
+    network: NetworkId,
+  ) -> Result<Option<u32>, SeraiError> {
+    self.0.storage(PALLET, "LastBatch", network).await
+  }
+
+  pub async fn batch_events(&self) -> Result<Vec<InInstructionsEvent>, SeraiError> {
     self
-      .events::<InInstructions, _>(block, |event| {
-        matches!(event, InInstructionsEvent::Batch { .. })
+      .0
+      .events(|event| {
+        if let serai_abi::Event::InInstructions(event) = event {
+          if matches!(event, InInstructionsEvent::Batch { .. }) {
+            Some(event.clone())
+          } else {
+            None
+          }
+        } else {
+          None
+        }
       })
       .await
   }
 
-  pub fn execute_batch(batch: SignedBatch) -> Encoded {
-    Self::unsigned::<InInstructions, _>(&in_instructions::Call::<Runtime>::execute_batch { batch })
+  pub fn execute_batch(batch: SignedBatch) -> Transaction {
+    Serai::unsigned(serai_abi::Call::InInstructions(
+      serai_abi::in_instructions::Call::execute_batch { batch },
+    ))
   }
 }
